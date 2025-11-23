@@ -6,42 +6,44 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
-from sklearn.cluster import KMeans  # not actually used here but fine to keep
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import r2_score, mean_squared_error
 import matplotlib.pyplot as plt
 
-# For reproducibility
 np.random.seed(7)
 
 # =====================
 # User Settings
 # =====================
+# Core investable universe (shared with Gradient Boost & PCA-LGBM models)
 TICKERS = [
     "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "BRK-B", "JNJ", "JPM", "XOM",
     "V", "PG", "MA", "HD", "CVX", "UNH", "MRK", "KO", "PEP", "ABBV",
-    "AVGO", "NFLX", "ADBE", "ORCL", "CSCO", "SPY"
+    "AVGO", "NFLX", "ADBE", "ORCL", "CSCO",
 ]
+
+# Separate benchmark index
+BENCH_TICKER = "SPY"
 
 START = "2010-01-01"
 END = None  # None = today
 
-REBAL_FREQ = "D"       # daily ML signals / trading
-LOOKBACK_DAYS = 252    # not used directly here but kept for parity
-TRAIN_MIN_MONTHS = 36  # idem
-
-# Model / features
+# RF feature + split settings
 FEATURE_COLS = ["mom_short", "mom_long", "vol"]
-TRAIN_END_DATE = "2023-12-31"   # train 2010–2023, test 2024–2025
-BACKTEST_START = "2019-01-02"   # when to start trading in the backtest
-TOP_K = 5                       # number of stocks each day
-LOOKBACK_FEATURE = 60           # days of history needed for features
+TRAIN_END_DATE = "2023-12-31"        # train on 2010–2023
+BACKTEST_START = "2024-01-02"        # **test ONLY on 2024–2025**
+BACKTEST_END = "2025-12-31"
+TOP_K = 5
+LOOKBACK_FEATURE = 60
 
-# Backtest settings
-RISK_FREE_ANNUAL = 0.015  # if you ever want to adjust Sharpe
-START_VALUE = 1000.0      # $1,000 initial capital for curves
+RISK_FREE_ANNUAL = 0.015
+START_VALUE = 1000.0
+RESULTS_DIR = "results"
 
-RESULTS_DIR = "results"   # where we save pickled results
+# Default RF hyperparameters (can be overridden from Streamlit by setting
+# module globals N_ESTIMATORS and MAX_DEPTH before calling build_results)
+N_ESTIMATORS_DEFAULT = 300
+MAX_DEPTH_DEFAULT = 6
 
 
 # =====================
@@ -83,13 +85,17 @@ def make_supervised_panel(rets, lookback_short=5, lookback_long=20):
 
 
 def backtest_ml_strategy(stock_rets, bench_rets, model,
-                         start_date="2019-01-02", top_k=5, lookback=60):
+                         start_date="2024-01-02", top_k=5, lookback=60):
     """
     Daily ML strategy: each day, predict next-day returns for all stocks,
-    go equal-weight into the top_k predictions, compare with SPY benchmark.
+    go equal-weight into the top_k predictions, compare with benchmark.
+    Backtest begins at `start_date` and ends at `BACKTEST_END`.
     """
     dates = stock_rets.index
-    dates = dates[dates >= start_date]
+    dates = dates[(dates >= start_date) & (dates <= BACKTEST_END)]
+
+    if len(dates) < 2:
+        raise ValueError("Not enough dates in backtest window.")
 
     portfolio_vals = [1.0]
     bench_vals = [1.0]
@@ -119,55 +125,68 @@ def backtest_ml_strategy(stock_rets, bench_rets, model,
             X_today.append([mom_short, mom_long, vol])
             tickers_today.append(tk)
 
-        if len(X_today) == 0:
+        X_today = np.array(X_today)
+        if len(tickers_today) == 0:
+            portfolio_vals.append(portfolio_vals[-1])
+            bench_vals.append(bench_vals[-1] * (1 + bench_rets.loc[next_date]))
+            bt_dates.append(next_date)
+            trade_log.append(
+                {
+                    "date": date,
+                    "chosen_stocks": [],
+                    "buys": [],
+                    "sells": [],
+                    "holds": [],
+                }
+            )
             continue
 
-        X_today = np.array(X_today)
         preds = model.predict(X_today)
-
-        # Select top-K by predicted return
         order = np.argsort(preds)[::-1]
-        k = min(top_k, len(order))
-        chosen_idx = order[:k]
-        chosen_tks = [tickers_today[j] for j in chosen_idx]
-        weights = {tk: 1.0 / k for tk in chosen_tks}
+        chosen = [tickers_today[i] for i in order[:top_k]]
 
-        current_holdings = set(chosen_tks)
-        buys = list(current_holdings - last_holdings)
-        sells = list(last_holdings - current_holdings)
-        holds = list(current_holdings & last_holdings)
+        tomorrow_rets = stock_rets.loc[next_date, chosen]
+        port_ret = tomorrow_rets.mean()
 
-        # Realized next-day portfolio return
-        r_p = 0.0
-        for tk in chosen_tks:
-            r_p += weights[tk] * stock_rets.loc[next_date, tk]
-        r_bench = bench_rets.loc[next_date]
+        bench_ret = bench_rets.loc[next_date]
 
-        portfolio_vals.append(portfolio_vals[-1] * np.exp(r_p))
-        bench_vals.append(bench_vals[-1] * np.exp(r_bench))
+        # Update portfolio and benchmark
+        portfolio_vals.append(portfolio_vals[-1] * (1 + port_ret))
+        bench_vals.append(bench_vals[-1] * (1 + bench_ret))
         bt_dates.append(next_date)
+
+        # Simple trade log
+        chosen_set = set(chosen)
+        buys = sorted(chosen_set - last_holdings)
+        sells = sorted(last_holdings - chosen_set)
+        holds = sorted(chosen_set & last_holdings)
 
         trade_log.append(
             {
                 "date": date,
-                "chosen_stocks": chosen_tks,
+                "chosen_stocks": chosen,
                 "buys": buys,
                 "sells": sells,
                 "holds": holds,
             }
         )
+        last_holdings = chosen_set
 
-        last_holdings = current_holdings
-
-    port_curve = pd.Series(portfolio_vals, index=bt_dates, name="ML_Portfolio")
-    bench_curve = pd.Series(bench_vals, index=bt_dates, name="SPY")
+    curve_port = pd.Series(portfolio_vals, index=bt_dates)
+    curve_bench = pd.Series(bench_vals, index=bt_dates)
     trade_log_df = pd.DataFrame(trade_log)
-
-    return port_curve, bench_curve, trade_log_df
+    return curve_port, curve_bench, trade_log_df
 
 
 def performance_stats(curve, periods_per_year=252):
     rets = np.log(curve / curve.shift(1)).dropna()
+    if len(rets) == 0:
+        return {
+            "Annualized return": np.nan,
+            "Annualized vol": np.nan,
+            "Sharpe (rf=0)": np.nan,
+            "Max drawdown": np.nan,
+        }
     mu_ann = rets.mean() * periods_per_year
     vol_ann = rets.std() * np.sqrt(periods_per_year)
     sharpe = mu_ann / vol_ann if vol_ann > 0 else np.nan
@@ -185,21 +204,31 @@ def performance_stats(curve, periods_per_year=252):
 # =====================
 
 def build_results(prices: pd.DataFrame) -> dict:
-    # Daily log returns
+    """
+    Build a results dictionary for the RF strategy.
+
+    - Train on daily supervised panel from 2010-01-01 up to TRAIN_END_DATE (inclusive).
+    - Backtest daily RF strategy ONLY on 2024-01-02 to 2025-12-31.
+    - Compare against a buy-and-hold benchmark index (BENCH_TICKER, e.g. SPY).
+    """
+    # Daily log returns for all downloaded assets (investable + benchmark)
     returns = np.log(prices / prices.shift(1)).dropna()
 
-    # Detect SPY / S&P 500 column
-    benchmark_candidates = ["SPY", "S&P 500", "^GSPC"]
+    # Restrict returns to a stable window
+    returns = returns.loc[START:BACKTEST_END]
+
+    # Detect benchmark column
+    benchmark_candidates = ["SPY", "S&P 500", "^GSPC", BENCH_TICKER]
     benchmark_col = None
     for c in benchmark_candidates:
         if c in returns.columns:
             benchmark_col = c
             break
     if benchmark_col is None:
-        raise ValueError("Could not find SPY / S&P 500 column in data.")
+        raise ValueError("Could not find benchmark column (SPY / ^GSPC) in data.")
 
-    # ML trades all tickers (including SPY)
-    trade_cols = list(returns.columns)
+    # ML trades all non-benchmark tickers
+    trade_cols = [c for c in returns.columns if c != benchmark_col]
     trade_rets = returns[trade_cols]
     bench_rets = returns[benchmark_col]
 
@@ -207,17 +236,21 @@ def build_results(prices: pd.DataFrame) -> dict:
     panel = make_supervised_panel(trade_rets)
 
     # Train / test split (on panel dates)
-    train = panel.loc[:TRAIN_END_DATE]
-    test = panel.loc[TRAIN_END_DATE:]
+    panel_train = panel.loc[:TRAIN_END_DATE]
+    panel_test = panel.loc[TRAIN_END_DATE:]
 
-    X_train = train[FEATURE_COLS].values
-    y_train = train["target"].values
-    X_test = test[FEATURE_COLS].values
-    y_test = test["target"].values
+    X_train = panel_train[FEATURE_COLS].values
+    y_train = panel_train["target"].values
+    X_test = panel_test[FEATURE_COLS].values
+    y_test = panel_test["target"].values
+
+    # Allow Streamlit to override these via module globals
+    n_est = globals().get("N_ESTIMATORS", N_ESTIMATORS_DEFAULT)
+    max_depth_val = globals().get("MAX_DEPTH", MAX_DEPTH_DEFAULT)
 
     model = RandomForestRegressor(
-        n_estimators=300,
-        max_depth=6,
+        n_estimators=int(n_est),
+        max_depth=int(max_depth_val),
         random_state=42,
         n_jobs=-1,
     )
@@ -227,7 +260,7 @@ def build_results(prices: pd.DataFrame) -> dict:
     r2 = r2_score(y_test, y_pred)
     rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 
-    # Backtest strategy vs SPY (from BACKTEST_START onward)
+    # Backtest strategy vs benchmark, ONLY from BACKTEST_START to BACKTEST_END
     port_curve, bench_curve, trades = backtest_ml_strategy(
         trade_rets,
         bench_rets,
@@ -237,17 +270,21 @@ def build_results(prices: pd.DataFrame) -> dict:
         lookback=LOOKBACK_FEATURE,
     )
 
-    # Performance stats
+    # Restrict curves explicitly to [BACKTEST_START, BACKTEST_END]
+    port_curve = port_curve.loc[BACKTEST_START:BACKTEST_END]
+    bench_curve = bench_curve.loc[BACKTEST_START:BACKTEST_END]
+
+    # Performance stats (daily)
     stats_port = performance_stats(port_curve)
     stats_bench = performance_stats(bench_curve)
 
-    # Convert to dollar curves starting at $1000
+    # Convert to dollar curves starting at START_VALUE
     ml_dollars = START_VALUE * (port_curve / port_curve.iloc[0])
-    spy_dollars = START_VALUE * (bench_curve / bench_curve.iloc[0])
-    ml_dollars.name = "ML_$"
-    spy_dollars.name = "SPY_$"
+    bench_dollars = START_VALUE * (bench_curve / bench_curve.iloc[0])
+    ml_dollars.name = "RF_$"
+    bench_dollars.name = "Benchmark_$"
 
-    # Keep a simplified trade log for the dashboard
+    # Simplified trade log for dashboard (all in test window 2024–2025)
     trade_log_simple = trades[["date", "chosen_stocks", "buys", "sells", "holds"]].copy()
 
     results = {
@@ -258,11 +295,12 @@ def build_results(prices: pd.DataFrame) -> dict:
         "feature_cols": FEATURE_COLS,
         "train_end_date": TRAIN_END_DATE,
         "backtest_start": BACKTEST_START,
+        "backtest_end": BACKTEST_END,
         "train_scores": {"r2": float(r2), "rmse": float(rmse)},
         "stats_port": stats_port,
         "stats_bench": stats_bench,
         "ml_curve": ml_dollars,
-        "bench_curve": spy_dollars,
+        "bench_curve": bench_dollars,
         "trade_log": trade_log_simple,
         "start": START,
         "end": END,
@@ -283,35 +321,21 @@ def save_results(results: dict, directory: str = RESULTS_DIR) -> str:
 
 def main():
     print("Downloading prices…")
-    px = download_prices(TICKERS, START, END)
-    print(f"Got {px.shape[1]} tickers, {px.shape[0]} rows.")
+    # Download both investable tickers and the benchmark index
+    all_tickers = list(dict.fromkeys(TICKERS + [BENCH_TICKER]))
+    px = download_prices(all_tickers, START, END)
+    print(f"Got {px.shape[1]} tickers (including benchmark), {px.shape[0]} rows.")
 
-    # Optional: keep a CSV around
-    px.to_csv("price_data_rf.csv")
-
-    print("Training RF model & running backtest…")
+    print("Training RF model & running backtest (2024–2025)…")
     results = build_results(px)
 
-    # Quick CLI summary
     ml_curve = results["ml_curve"]
     bench_curve = results["bench_curve"]
-    print(f"Final ML portfolio value: ${ml_curve.iloc[-1]:.2f}")
-    print(f"Final SPY value:          ${bench_curve.iloc[-1]:.2f}")
+    print(f"Final RF portfolio value: ${ml_curve.iloc[-1]:.2f}")
+    print(f"Final benchmark value:    ${bench_curve.iloc[-1]:.2f}")
 
     out_path = save_results(results, RESULTS_DIR)
     print(f"Saved RF results to: {out_path}")
-
-    # Optional quick matplotlib plot
-    plt.figure(figsize=(10, 5))
-    plt.plot(ml_curve.index, ml_curve.values, label="RF Strategy", linewidth=2)
-    plt.plot(bench_curve.index, bench_curve.values, label="S&P 500 (SPY)", linewidth=2)
-    plt.title("Portfolio Value: RF Strategy vs S&P 500 (Starting at $1,000)")
-    plt.xlabel("Date")
-    plt.ylabel("Portfolio Value ($)")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
 
 
 if __name__ == "__main__":

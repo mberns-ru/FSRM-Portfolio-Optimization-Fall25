@@ -435,21 +435,24 @@ def build_results(prices: pd.DataFrame) -> dict:
     """
     Runs the full backtest, builds benchmark and metrics,
     and returns a dict suitable for saving to disk and reloading in Streamlit.
+
+    Train window: 2010–2023
+    Test window:  2024–2025
+    Benchmark:    SPY ($1000 buy-and-hold from 2025-01-01)
     """
     monthly, weights = run_backtest(prices, store_weights=True)
 
     # ---- Train / Test split ----
-    # Train: 2010–2023, Test: 2024–2025
     monthly_train = monthly.loc["2010-01-01":"2023-12-31"]
     monthly_test = monthly.loc["2024-01-01":"2025-12-31"]
 
-    # Portfolio composition: every 2 months in 2025 (unchanged)
+    # Portfolio composition: every 2 months in 2025
     weights_2025 = weights.loc["2025-01-01":"2025-12-31"]
     weights_2025_bimonth = weights_2025.sort_index().iloc[::2]
 
-    # S&P 500 benchmark: $1000 invested on 2025-01-01
+    # SPY benchmark: $1000 invested on 2025-01-01
     bench_px = yf.download(
-        "^GSPC",
+        "SPY",
         start="2025-01-01",
         end="2026-01-01",
         auto_adjust=True,
@@ -459,16 +462,16 @@ def build_results(prices: pd.DataFrame) -> dict:
     bench_initial = bench_px.iloc[0]
     bench_equity = 1000.0 * bench_px / bench_initial
     bench_equity_m = bench_equity.resample("M").last()
-    bench_equity_m.name = "SP500_$1000"
+    bench_equity_m.name = "SPY_$1000"
 
-    # Only 2025 ML returns for the equity curve vs S&P
+    # Only 2025 ML returns for the equity curve vs SPY
     ml_ret_2025 = monthly.loc["2025-01-01":"2025-12-31"]["ML_Opt"]
     ml_equity = 1000.0 * (1.0 + ml_ret_2025).cumprod()
     ml_equity.name = "ML_Opt_$1000"
 
     equity_compare_2025 = pd.concat([ml_equity, bench_equity_m], axis=1).dropna()
 
-    # Performance metrics (now test = 2024+2025)
+    # Performance metrics (train = 2010–2023, test = 2024–2025)
     metrics = {
         "train": {
             "ML_Opt": compute_perf_metrics(monthly_train["ML_Opt"]),
@@ -495,7 +498,6 @@ def build_results(prices: pd.DataFrame) -> dict:
         "use_xgb": USE_XGB,
     }
     return results
-
 
 def save_results(results: dict, directory: str = RESULTS_DIR) -> str:
     os.makedirs(directory, exist_ok=True)
