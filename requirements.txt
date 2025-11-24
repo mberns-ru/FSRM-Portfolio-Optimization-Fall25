@@ -1,0 +1,10 @@
+streamlit
+numpy
+pandas
+yfinance
+scikit-learn
+python-dateutil
+altair
+tqdm
+xgboost
+lightgbm
