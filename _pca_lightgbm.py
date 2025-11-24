@@ -9,6 +9,7 @@ import yfinance as yf
 from dateutil.relativedelta import relativedelta
 from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
+import _gradientboost as gb
 
 # Try LightGBM; fall back if missing
 try:
@@ -37,6 +38,12 @@ from _gradientboost import (  # reuse universe & utilities
     meanvar_weights,
     compute_perf_metrics,
 )
+
+TRAIN_START = getattr(gb, "TRAIN_START", "2010-01-01")
+TRAIN_END   = getattr(gb, "TRAIN_END", "2023-12-31")
+TEST_START  = getattr(gb, "TEST_START", "2024-01-01")
+TEST_END    = getattr(gb, "TEST_END", "2025-12-31")
+INITIAL_INVESTMENT = getattr(gb, "INITIAL_INVESTMENT", 1000.0)
 
 try:
     from tqdm.auto import tqdm
@@ -281,36 +288,48 @@ def run_backtest(prices: pd.DataFrame, store_weights: bool = False):
 
 def build_results(prices: pd.DataFrame) -> dict:
     """
-    Train: 2010–2023
-    Test:  2024–2025
-    Benchmark: SPY ($1000 from 2025-01-01)
+    Train: TRAIN_START–TRAIN_END
+    Test:  TEST_START–TEST_END
+    Benchmark: SPY (equity scaled to INITIAL_INVESTMENT from TEST_START)
     """
     monthly, weights = run_backtest(prices, store_weights=True)
 
-    monthly_train = monthly.loc["2010-01-01":"2023-12-31"]
-    monthly_test = monthly.loc["2024-01-01":"2025-12-31"]
+    monthly_train = monthly.loc[TRAIN_START:TRAIN_END]
+    monthly_test = monthly.loc[TEST_START:TEST_END]
 
-    weights_2025 = weights.loc["2025-01-01":"2025-12-31"]
-    weights_2025_bimonth = weights_2025.sort_index().iloc[::2]
+    weights_test = weights.loc[TEST_START:TEST_END]
+    weights_test_bimonth = weights_test.sort_index().iloc[::2]
 
     bench_px = yf.download(
         "SPY",
-        start="2025-01-01",
-        end="2026-01-01",
+        start=TEST_START,
+        end=(pd.to_datetime(TEST_END) + relativedelta(days=10)).strftime("%Y-%m-%d"),
         auto_adjust=True,
         progress=False,
     )["Close"].dropna()
 
     bench_initial = bench_px.iloc[0]
-    bench_equity = 1000.0 * bench_px / bench_initial
+    bench_equity = INITIAL_INVESTMENT * bench_px / bench_initial
     bench_equity_m = bench_equity.resample("M").last()
-    bench_equity_m.name = "SPY_$1000"
+    bench_equity_m = bench_equity_m.loc[monthly_test.index.min():monthly_test.index.max()]
+    bench_equity_m.name = f"SPY_${int(INITIAL_INVESTMENT)}"
 
+    ml_equity_test = INITIAL_INVESTMENT * (1.0 + monthly_test["ML_Opt"]).cumprod()
+    ml_equity_test.index = monthly_test.index
+    ml_equity_test.name = f"ML_Opt_${int(INITIAL_INVESTMENT)}"
+
+    equity_test = pd.concat([ml_equity_test, bench_equity_m], axis=1).dropna()
+
+    # 2025-only, for backward compatibility with older pages
     ml_ret_2025 = monthly.loc["2025-01-01":"2025-12-31"]["ML_Opt"]
-    ml_equity = 1000.0 * (1.0 + ml_ret_2025).cumprod()
-    ml_equity.name = "ML_Opt_$1000"
-
-    equity_compare_2025 = pd.concat([ml_equity, bench_equity_m], axis=1).dropna()
+    if not ml_ret_2025.empty:
+        ml_equity_2025 = INITIAL_INVESTMENT * (1.0 + ml_ret_2025).cumprod()
+        ml_equity_2025.name = f"ML_Opt_${int(INITIAL_INVESTMENT)}"
+        bench_equity_2025 = bench_equity.loc["2025-01-01":"2025-12-31"].resample("M").last()
+        bench_equity_2025.name = f"SPY_${int(INITIAL_INVESTMENT)}"
+        equity_2025 = pd.concat([ml_equity_2025, bench_equity_2025], axis=1).dropna()
+    else:
+        equity_2025 = equity_test.copy()
 
     metrics = {
         "train": {
@@ -331,12 +350,19 @@ def build_results(prices: pd.DataFrame) -> dict:
         "monthly_train": monthly_train,
         "monthly_test": monthly_test,
         "metrics": metrics,
-        "weights_2025_bimonth": weights_2025_bimonth,
-        "equity_compare_2025": equity_compare_2025,
+        "weights_test_bimonth": weights_test_bimonth,
+        "weights_2025_bimonth": weights.loc["2025-01-01":"2025-12-31"].sort_index().iloc[::2],
+        "equity_test": equity_test,
+        "equity_compare_2025": equity_2025,
         "use_lightgbm": HAS_LIGHTGBM,
         "tickers": TICKERS,
         "start": START,
         "end": END,
+        "train_start": TRAIN_START,
+        "train_end": TRAIN_END,
+        "test_start": TEST_START,
+        "test_end": TEST_END,
+        "initial_investment": float(INITIAL_INVESTMENT),
     }
     return results
 

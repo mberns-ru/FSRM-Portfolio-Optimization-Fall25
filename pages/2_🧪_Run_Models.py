@@ -12,10 +12,8 @@ except Exception:
 
 try:
     import _randomforest as rf
-    from sklearn.ensemble import RandomForestRegressor as SKRandomForestRegressor
 except Exception:
     rf = None
-    SKRandomForestRegressor = None  # type: ignore
 
 try:
     import _pca_lightgbm as pl
@@ -24,7 +22,7 @@ except Exception:
 
 
 st.set_page_config(
-    page_title="🧪 Run Backtests",
+    page_title="🧪 Run & Save ML Portfolio Backtests",
     layout="wide",
 )
 
@@ -32,160 +30,216 @@ st.title("🧪 Run & Save ML Portfolio Backtests")
 
 st.markdown(
     """
-Use this page to **generate new results files** for your models.
+Use this page to **generate new results files** for your three models.
 
-1. Pick a model and adjust its key parameters.  
-2. Click **Run backtest**.  
-3. The script will download data, train, backtest, and save a timestamped
-   `.pkl` in the `results/` folder.  
-4. You can also download that file directly and upload it on the results pages.
+On this page you change only the **finance-related knobs**:
+
+- Data range (start / end)
+- Train vs test split (years)
+- Rebalance frequency (monthly vs quarterly)
+- Risk aversion λ
+- Transaction costs (bps)
+- Risk-free rate
+- Initial investment for test-window equity curves
+
+ML hyperparameters stay fixed inside the model scripts.
 """
 )
 
+
+def date_to_str(d):
+    return d.strftime("%Y-%m-%d") if d is not None else None
+
+
+def year_from_str(s, default_year):
+    try:
+        return int(s[:4])
+    except Exception:
+        return default_year
+
+
+# ----------------------------------------------------------
+# Common controls helper
+# ----------------------------------------------------------
+def finance_controls(defaults, prefix: str):
+    """
+    Build the common finance controls and return a dict of values.
+    `defaults` is a dict with keys:
+    start, end, train_start, train_end, test_start, test_end,
+    lambda_risk, tc_bps, rf_rate, rebal_freq, initial_investment
+    """
+    with st.form(f"{prefix}_form"):
+        col_dates, col_split, col_finance = st.columns(3)
+
+        # --- Data range ---
+        with col_dates:
+            start_date = st.date_input(
+                "Price history start",
+                value=defaults["start_date"],
+            )
+            end_date = st.date_input(
+                "Price history end",
+                value=defaults["end_date"],
+            )
+
+            rebal_freq_label = st.selectbox(
+                "Rebalance frequency",
+                options=["Monthly", "Quarterly"],
+                index=0 if defaults["rebal_freq"] == "M" else 1,
+            )
+            rebal_freq = "M" if rebal_freq_label == "Monthly" else "Q"
+
+        # --- Train / Test split (by year) ---
+        with col_split:
+            st.markdown("**Train / Test split (years)**")
+            train_start_year = st.number_input(
+                "Train start year",
+                min_value=1990,
+                max_value=2100,
+                value=defaults["train_start_year"],
+                step=1,
+            )
+            train_end_year = st.number_input(
+                "Train end year",
+                min_value=1990,
+                max_value=2100,
+                value=defaults["train_end_year"],
+                step=1,
+            )
+            test_start_year = st.number_input(
+                "Test start year",
+                min_value=1990,
+                max_value=2100,
+                value=defaults["test_start_year"],
+                step=1,
+            )
+            test_end_year = st.number_input(
+                "Test end year",
+                min_value=1990,
+                max_value=2100,
+                value=defaults["test_end_year"],
+                step=1,
+            )
+
+        # --- Finance parameters ---
+        with col_finance:
+            lambda_risk = st.slider(
+                "Risk aversion (λ)",
+                min_value=0.5,
+                max_value=20.0,
+                value=float(defaults["lambda_risk"]),
+                step=0.5,
+            )
+            tc_bps = st.slider(
+                "Transaction cost (bps per $ turnover)",
+                min_value=0,
+                max_value=50,
+                value=int(defaults["tc_bps"]),
+                step=1,
+            )
+            rf_rate = st.slider(
+                "Risk-free annual rate (for Sharpe)",
+                min_value=0.0,
+                max_value=0.05,
+                value=float(defaults["rf_rate"]),
+                step=0.0025,
+            )
+            initial_investment = st.number_input(
+                "Initial investment for test equity curves",
+                min_value=100.0,
+                max_value=100000.0,
+                value=float(defaults["initial_investment"]),
+                step=100.0,
+            )
+
+        run_button = st.form_submit_button(f"🚀 Run {prefix} backtest")
+
+    # Construct split dates
+    train_start = f"{int(train_start_year)}-01-01"
+    train_end = f"{int(train_end_year)}-12-31"
+    test_start = f"{int(test_start_year)}-01-01"
+    test_end = f"{int(test_end_year)}-12-31"
+
+    return {
+        "run": run_button,
+        "start_date": start_date,
+        "end_date": end_date,
+        "rebal_freq": rebal_freq,
+        "train_start": train_start,
+        "train_end": train_end,
+        "test_start": test_start,
+        "test_end": test_end,
+        "lambda_risk": float(lambda_risk),
+        "tc_bps": int(tc_bps),
+        "rf_rate": float(rf_rate),
+        "initial_investment": float(initial_investment),
+    }
+
+
+# ==========================================================
+# Gradient Boost
+# ==========================================================
 model_choice = st.selectbox(
     "Choose which model to run",
     options=[
         "Gradient Boost (XGBoost / GBM)",
         "Random Forest",
-        "PCA + LightGBM (Masuda)",
+        "PCA + LightGBM",
     ],
 )
 
-
-def date_to_str(d):
-    if d is None:
-        return None
-    return d.strftime("%Y-%m-%d")
-
-
-# =============================================================
-# Gradient Boost model controls
-# =============================================================
 if model_choice.startswith("Gradient"):
 
     if gb is None:
-        st.error(
-            "Could not import `_gradientboost.py`. "
-            "Make sure the file exists and has no import errors."
-        )
+        st.error("Could not import `_gradientboost.py`.")
         st.stop()
 
-    st.subheader("Gradient Boost Backtest Settings")
+    st.subheader("📈 Gradient Boost Settings")
 
     default_start = getattr(gb, "START", "2010-01-01")
     default_end = getattr(gb, "END", None)
-    default_lambda = float(getattr(gb, "LAMBDA_RISK", 5.0))
+    default_train_start = getattr(gb, "TRAIN_START", "2010-01-01")
+    default_train_end = getattr(gb, "TRAIN_END", "2023-12-31")
+    default_test_start = getattr(gb, "TEST_START", "2024-01-01")
+    default_test_end = getattr(gb, "TEST_END", "2025-12-31")
 
-    try:
-        start_default_date = date.fromisoformat(default_start)
-    except Exception:
-        start_default_date = date(2010, 1, 1)
+    start_default_date = date.fromisoformat(default_start)
+    end_default_date = date.today() if default_end in (None, "") else date.fromisoformat(default_end)
 
-    if default_end in (None, ""):
-        end_default_date = date.today()
-    else:
-        try:
-            end_default_date = date.fromisoformat(default_end)
-        except Exception:
-            end_default_date = date.today()
+    defaults = {
+        "start_date": start_default_date,
+        "end_date": end_default_date,
+        "rebal_freq": getattr(gb, "REBAL_FREQ", "M"),
+        "train_start_year": year_from_str(default_train_start, 2010),
+        "train_end_year": year_from_str(default_train_end, 2023),
+        "test_start_year": year_from_str(default_test_start, 2024),
+        "test_end_year": year_from_str(default_test_end, 2025),
+        "lambda_risk": getattr(gb, "LAMBDA_RISK", 5.0),
+        "tc_bps": getattr(gb, "TC_BPS", 5),
+        "rf_rate": getattr(gb, "RISK_FREE_ANNUAL", 0.015),
+        "initial_investment": getattr(gb, "INITIAL_INVESTMENT", 1000.0),
+    }
 
-    with st.form("gbm_form"):
-        col_dates, col_params = st.columns(2)
+    controls = finance_controls(defaults, prefix="GBM")
 
-        with col_dates:
-            start_date = st.date_input(
-                "Start date",
-                value=start_default_date,
-                help="Start of price history to download.",
-            )
-            end_date = st.date_input(
-                "End date",
-                value=end_default_date,
-                help="End of price history (usually today).",
-            )
-            lambda_risk = st.slider(
-                "Risk aversion (λ)",
-                min_value=0.5,
-                max_value=20.0,
-                value=default_lambda,
-                step=0.5,
-                help="Higher λ puts more weight on risk minimization.",
-            )
+    if controls["run"]:
+        # Push settings into module
+        gb.START = date_to_str(controls["start_date"])
+        gb.END = date_to_str(controls["end_date"])
+        gb.REBAL_FREQ = controls["rebal_freq"]
+        gb.TRAIN_START = controls["train_start"]
+        gb.TRAIN_END = controls["train_end"]
+        gb.TEST_START = controls["test_start"]
+        gb.TEST_END = controls["test_end"]
+        gb.LAMBDA_RISK = controls["lambda_risk"]
+        gb.TC_BPS = controls["tc_bps"]
+        gb.RISK_FREE_ANNUAL = controls["rf_rate"]
+        gb.INITIAL_INVESTMENT = controls["initial_investment"]
 
-        with col_params:
-            st.markdown("**XGBoost / GBM hyperparameters**")
-            n_estimators = st.slider("n_estimators", 50, 800, 400, step=50)
-            max_depth = st.slider("max_depth", 2, 10, 3)
-            learning_rate = st.slider(
-                "learning_rate", 0.01, 0.30, 0.05, step=0.01
-            )
-            subsample = st.slider("subsample", 0.3, 1.0, 0.9, step=0.05)
-            colsample_bytree = st.slider(
-                "colsample_bytree", 0.3, 1.0, 0.9, step=0.05
-            )
-
-        run_gbm = st.form_submit_button("🚀 Run Gradient Boost backtest")
-
-    if run_gbm:
-        # Patch global settings used in the module
-        gb.LAMBDA_RISK = float(lambda_risk)
-        gb.START = date_to_str(start_date)
-        gb.END = date_to_str(end_date)
-
-        # Patch the model factory so run_backtest uses our hyperparameters
-        def custom_make_gbm():
-            # If XGBoost is available in the module, use it; otherwise fallback to sklearn GBM
-            if getattr(gb, "USE_XGB", False):
-                try:
-                    from xgboost import XGBRegressor  # type: ignore
-
-                    try:
-                        return XGBRegressor(
-                            n_estimators=n_estimators,
-                            max_depth=max_depth,
-                            learning_rate=learning_rate,
-                            subsample=subsample,
-                            colsample_bytree=colsample_bytree,
-                            tree_method="hist",
-                            device="cuda",
-                            random_state=7,
-                        )
-                    except TypeError:
-                        # Older versions without 'device' argument
-                        return XGBRegressor(
-                            n_estimators=n_estimators,
-                            max_depth=max_depth,
-                            learning_rate=learning_rate,
-                            subsample=subsample,
-                            colsample_bytree=colsample_bytree,
-                            tree_method="gpu_hist",
-                            random_state=7,
-                        )
-                except Exception:
-                    pass  # fall through to sklearn GBM
-
-            # CPU-only fallback
-            try:
-                from sklearn.ensemble import GradientBoostingRegressor
-            except Exception:
-                raise RuntimeError("Neither XGBoost nor sklearn GBM is available.")
-
-            return GradientBoostingRegressor(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                learning_rate=learning_rate,
-                subsample=subsample,
-                random_state=7,
-            )
-
-        gb.make_gbm = custom_make_gbm  # type: ignore[assignment]
-
-        # ---- Progress bar wired to gb.tqdm ----
         progress = st.progress(0, text="Downloading prices…")
         prices = gb.download_prices(gb.TICKERS, gb.START, gb.END)
-        progress.progress(5, text="Initializing backtest…")
+        progress.progress(5, text="Running backtest…")
 
-        # Wrap tqdm inside the GBM module so we can drive the Streamlit progress bar
         def streamlit_tqdm(iterable, **kwargs):
             seq = list(iterable)
             total = len(seq)
@@ -194,10 +248,7 @@ if model_choice.startswith("Gradient"):
             for i, x in enumerate(seq):
                 frac = (i + 1) / total
                 pct = 5 + int(90 * frac)
-                progress.progress(
-                    pct,
-                    text=f"Running Gradient Boost backtest… ({int(100*frac)}%)",
-                )
+                progress.progress(pct, text=f"Running GBM backtest… ({int(frac*100)}%)")
                 yield x
 
         gb.tqdm = streamlit_tqdm  # type: ignore[assignment]
@@ -207,206 +258,69 @@ if model_choice.startswith("Gradient"):
         out_path = gb.save_results(results, gb.RESULTS_DIR)
         progress.progress(100, text="Done!")
 
-        st.success(f"Saved Gradient Boost results to: `{out_path}`")
-        try:
-            with open(out_path, "rb") as f:
-                st.download_button(
-                    "⬇️ Download GBM results file",
-                    data=f,
-                    file_name=os.path.basename(out_path),
-                    mime="application/octet-stream",
-                )
-        except Exception:
-            st.info(
-                "The file has been saved on disk in the `results/` folder. "
-                "If the download button does not work, you can fetch it manually."
+        st.success(f"Saved GBM results to: `{out_path}`")
+        with open(out_path, "rb") as f:
+            st.download_button(
+                "⬇️ Download GBM results",
+                data=f,
+                file_name=os.path.basename(out_path),
+                mime="application/octet-stream",
             )
 
-# =============================================================
-# Random Forest model controls
-# =============================================================
+# ==========================================================
+# Random Forest
+# ==========================================================
 elif model_choice.startswith("Random"):
 
-    if rf is None:
-        st.error(
-            "Could not import `_randomforest.py`. "
-            "Make sure the file exists and has no import errors."
-        )
+    if rf is None or gb is None:
+        st.error("Could not import `_randomforest.py` / `_gradientboost.py`.")
         st.stop()
 
-    st.subheader("Random Forest Backtest Settings")
+    st.subheader("🌲 Random Forest Settings")
 
-    default_start = getattr(rf, "START", "2010-01-01")
-    default_end = getattr(rf, "END", None)
-    default_train_end = getattr(rf, "TRAIN_END_DATE", "2023-12-31")
-    default_backtest_start = getattr(rf, "BACKTEST_START", "2024-01-02")
-    default_top_k = int(getattr(rf, "TOP_K", 5))
-    default_start_value = float(getattr(rf, "START_VALUE", 1000.0))
+    default_start = getattr(rf, "START", getattr(gb, "START", "2010-01-01"))
+    default_end = getattr(rf, "END", getattr(gb, "END", None))
+    default_train_start = getattr(gb, "TRAIN_START", "2010-01-01")
+    default_train_end = getattr(gb, "TRAIN_END", "2023-12-31")
+    default_test_start = getattr(gb, "TEST_START", "2024-01-01")
+    default_test_end = getattr(gb, "TEST_END", "2025-12-31")
 
-    try:
-        start_default_date = date.fromisoformat(default_start)
-    except Exception:
-        start_default_date = date(2010, 1, 1)
+    start_default_date = date.fromisoformat(default_start)
+    end_default_date = date.today() if default_end in (None, "") else date.fromisoformat(default_end)
 
-    if not default_end:
-        end_default_date = date.today()
-    else:
-        try:
-            end_default_date = date.fromisoformat(default_end)
-        except Exception:
-            end_default_date = date.today()
+    defaults = {
+        "start_date": start_default_date,
+        "end_date": end_default_date,
+        "rebal_freq": getattr(gb, "REBAL_FREQ", "M"),
+        "train_start_year": year_from_str(default_train_start, 2010),
+        "train_end_year": year_from_str(default_train_end, 2023),
+        "test_start_year": year_from_str(default_test_start, 2024),
+        "test_end_year": year_from_str(default_test_end, 2025),
+        "lambda_risk": getattr(gb, "LAMBDA_RISK", 5.0),
+        "tc_bps": getattr(gb, "TC_BPS", 5),
+        "rf_rate": getattr(gb, "RISK_FREE_ANNUAL", 0.015),
+        "initial_investment": getattr(gb, "INITIAL_INVESTMENT", 1000.0),
+    }
 
-    try:
-        train_end_default = date.fromisoformat(default_train_end)
-    except Exception:
-        train_end_default = date(2023, 12, 31)
+    controls = finance_controls(defaults, prefix="RF")
 
-    try:
-        bt_start_default = date.fromisoformat(default_backtest_start)
-    except Exception:
-        bt_start_default = date(2024, 1, 2)
-
-    with st.form("rf_form"):
-        col_dates, col_params = st.columns(2)
-
-        with col_dates:
-            start_date = st.date_input(
-                "Start date",
-                value=start_default_date,
-                help="Start of price history to download.",
-            )
-            end_date = st.date_input(
-                "End date",
-                value=end_default_date,
-                help="End of price history (usually today).",
-            )
-            train_end = st.date_input(
-                "Train end date",
-                value=train_end_default,
-                help="Last date included in the training split.",
-            )
-            backtest_start = st.date_input(
-                "Backtest start date",
-                value=bt_start_default,
-                help="First date used in the RF strategy backtest.",
-            )
-
-        with col_params:
-            top_k = st.slider(
-                "Top-K stocks per day",
-                min_value=1,
-                max_value=20,
-                value=default_top_k,
-            )
-            n_estimators = st.slider("n_estimators", 50, 800, 300, step=50)
-            max_depth = st.slider("max_depth", 2, 20, 6)
-            start_value = st.number_input(
-                "Initial capital ($)",
-                min_value=100.0,
-                max_value=1000000.0,
-                value=default_start_value,
-                step=100.0,
-            )
-
-        run_rf = st.form_submit_button("🚀 Run Random Forest backtest")
-
-    if run_rf:
-        if hasattr(rf, "START"):
-            rf.START = date_to_str(start_date)
-        if hasattr(rf, "END"):
-            rf.END = date_to_str(end_date)
-        if hasattr(rf, "TRAIN_END_DATE"):
-            rf.TRAIN_END_DATE = date_to_str(train_end)
-        if hasattr(rf, "BACKTEST_START"):
-            rf.BACKTEST_START = date_to_str(backtest_start)
-        if hasattr(rf, "TOP_K"):
-            rf.TOP_K = int(top_k)
-        if hasattr(rf, "START_VALUE"):
-            rf.START_VALUE = float(start_value)
-
-        # Pass RF hyperparameters to the module so build_results can see them
-        rf.N_ESTIMATORS = int(n_estimators)
-        rf.MAX_DEPTH = int(max_depth)
+    if controls["run"]:
+        gb.START = rf.START = date_to_str(controls["start_date"])
+        gb.END = rf.END = date_to_str(controls["end_date"])
+        gb.REBAL_FREQ = rf.REBAL_FREQ = controls["rebal_freq"]
+        gb.TRAIN_START = controls["train_start"]
+        gb.TRAIN_END = controls["train_end"]
+        gb.TEST_START = controls["test_start"]
+        gb.TEST_END = controls["test_end"]
+        gb.LAMBDA_RISK = rf.LAMBDA_RISK = controls["lambda_risk"]
+        gb.TC_BPS = rf.TC_BPS = controls["tc_bps"]
+        gb.RISK_FREE_ANNUAL = rf.RISK_FREE_ANNUAL = controls["rf_rate"]
+        gb.INITIAL_INVESTMENT = rf.INITIAL_INVESTMENT = controls["initial_investment"]
 
         progress = st.progress(0, text="Downloading prices…")
-        # Include SPY benchmark along with the stock universe
-        all_tickers = list(dict.fromkeys(rf.TICKERS + [rf.BENCH_TICKER]))
-        prices = rf.download_prices(all_tickers, rf.START, rf.END)
+        prices = rf.download_prices(rf.TICKERS, rf.START, rf.END)
+        progress.progress(5, text="Running RF backtest…")
 
-        progress.progress(40, text="Running Random Forest backtest…")
-        results = rf.build_results(prices)
-
-        progress.progress(80, text="Saving results…")
-        out_path = rf.save_results(results, rf.RESULTS_DIR)
-        progress.progress(100, text="Done!")
-
-        st.success(f"Saved Random Forest results to: `{out_path}`")
-        try:
-            with open(out_path, "rb") as f:
-                st.download_button(
-                    "⬇️ Download RF results file",
-                    data=f,
-                    file_name=os.path.basename(out_path),
-                    mime="application/octet-stream",
-                )
-        except Exception:
-            st.info(
-                "The file has been saved on disk in the `results/` folder. "
-                "If the download button does not work, you can fetch it manually."
-            )
-
-# =============================================================
-# PCA + LightGBM model controls
-# =============================================================
-else:
-    if pl is None:
-        st.error(
-            "Could not import `_pca_lightgbm.py`. "
-            "Make sure the file exists and has no import errors."
-        )
-        st.stop()
-
-    st.subheader("PCA + LightGBM Backtest Settings")
-
-    default_start = getattr(pl, "START", "2010-01-01")
-    default_end = getattr(pl, "END", None)
-
-    try:
-        start_default_date = date.fromisoformat(default_start)
-    except Exception:
-        start_default_date = date(2010, 1, 1)
-
-    if default_end in (None, ""):
-        end_default_date = date.today()
-    else:
-        try:
-            end_default_date = date.fromisoformat(default_end)
-        except Exception:
-            end_default_date = date.today()
-
-    with st.form("pca_lgbm_form"):
-        start_date = st.date_input(
-            "Start date",
-            value=start_default_date,
-            help="Start of price history to download.",
-        )
-        end_date = st.date_input(
-            "End date",
-            value=end_default_date,
-            help="End of price history (usually today).",
-        )
-
-        run_pl = st.form_submit_button("🚀 Run PCA + LightGBM backtest")
-
-    if run_pl:
-        pl.START = date_to_str(start_date)
-        pl.END = date_to_str(end_date)
-
-        progress = st.progress(0, text="Downloading prices…")
-        prices = pl.download_prices(pl.TICKERS, pl.START, pl.END)
-        progress.progress(5, text="Initializing backtest…")
-
-        # Wrap tqdm inside the PCA+LGBM module
         def streamlit_tqdm(iterable, **kwargs):
             seq = list(iterable)
             total = len(seq)
@@ -415,10 +329,88 @@ else:
             for i, x in enumerate(seq):
                 frac = (i + 1) / total
                 pct = 5 + int(90 * frac)
-                progress.progress(
-                    pct,
-                    text=f"Running PCA + LightGBM backtest… ({int(100*frac)}%)",
-                )
+                progress.progress(pct, text=f"Running RF backtest… ({int(frac*100)}%)")
+                yield x
+
+        gb.tqdm = streamlit_tqdm  # RF uses gb.run_backtest internally
+
+        results = rf.build_results(prices)
+        progress.progress(98, text="Saving results…")
+        out_path = rf.save_results(results, rf.RESULTS_DIR)
+        progress.progress(100, text="Done!")
+
+        st.success(f"Saved RF results to: `{out_path}`")
+        with open(out_path, "rb") as f:
+            st.download_button(
+                "⬇️ Download RF results",
+                data=f,
+                file_name=os.path.basename(out_path),
+                mime="application/octet-stream",
+            )
+
+# ==========================================================
+# PCA + LightGBM
+# ==========================================================
+else:
+
+    if pl is None or gb is None:
+        st.error("Could not import `_pca_lightgbm.py` / `_gradientboost.py`.")
+        st.stop()
+
+    st.subheader("🧬 PCA + LightGBM Settings")
+
+    default_start = getattr(pl, "START", getattr(gb, "START", "2010-01-01"))
+    default_end = getattr(pl, "END", getattr(gb, "END", None))
+    default_train_start = getattr(gb, "TRAIN_START", "2010-01-01")
+    default_train_end = getattr(gb, "TRAIN_END", "2023-12-31")
+    default_test_start = getattr(gb, "TEST_START", "2024-01-01")
+    default_test_end = getattr(gb, "TEST_END", "2025-12-31")
+
+    start_default_date = date.fromisoformat(default_start)
+    end_default_date = date.today() if default_end in (None, "") else date.fromisoformat(default_end)
+
+    defaults = {
+        "start_date": start_default_date,
+        "end_date": end_default_date,
+        "rebal_freq": getattr(gb, "REBAL_FREQ", "M"),
+        "train_start_year": year_from_str(default_train_start, 2010),
+        "train_end_year": year_from_str(default_train_end, 2023),
+        "test_start_year": year_from_str(default_test_start, 2024),
+        "test_end_year": year_from_str(default_test_end, 2025),
+        "lambda_risk": getattr(gb, "LAMBDA_RISK", 5.0),
+        "tc_bps": getattr(gb, "TC_BPS", 5),
+        "rf_rate": getattr(gb, "RISK_FREE_ANNUAL", 0.015),
+        "initial_investment": getattr(gb, "INITIAL_INVESTMENT", 1000.0),
+    }
+
+    controls = finance_controls(defaults, prefix="PCA_LGBM")
+
+    if controls["run"]:
+        pl.START = date_to_str(controls["start_date"])
+        pl.END = date_to_str(controls["end_date"])
+        pl.REBAL_FREQ = controls["rebal_freq"]
+        gb.TRAIN_START = pl.TRAIN_START = controls["train_start"]
+        gb.TRAIN_END = pl.TRAIN_END = controls["train_end"]
+        gb.TEST_START = pl.TEST_START = controls["test_start"]
+        gb.TEST_END = pl.TEST_END = controls["test_end"]
+        gb.LAMBDA_RISK = pl.LAMBDA_RISK = controls["lambda_risk"]
+        gb.TC_BPS = pl.TC_BPS = controls["tc_bps"]
+        gb.RISK_FREE_ANNUAL = controls["rf_rate"]
+        gb.INITIAL_INVESTMENT = pl.INITIAL_INVESTMENT = controls["initial_investment"]
+
+        progress = st.progress(0, text="Downloading prices…")
+        prices = pl.download_prices(pl.TICKERS, pl.START, pl.END)
+        progress.progress(5, text="Running PCA + LightGBM backtest…")
+
+        def streamlit_tqdm(iterable, **kwargs):
+            seq = list(iterable)
+            total = len(seq)
+            if total == 0:
+                return seq
+            for i, x in enumerate(seq):
+                frac = (i + 1) / total
+                pct = 5 + int(90 * frac)
+                progress.progress(pct, text=f"Running PCA+LGBM backtest… ({int(frac*100)}%)")
                 yield x
 
         pl.tqdm = streamlit_tqdm  # type: ignore[assignment]
@@ -428,17 +420,11 @@ else:
         out_path = pl.save_results(results, pl.RESULTS_DIR)
         progress.progress(100, text="Done!")
 
-        st.success(f"Saved PCA + LightGBM results to: `{out_path}`")
-        try:
-            with open(out_path, "rb") as f:
-                st.download_button(
-                    "⬇️ Download PCA+LGBM results file",
-                    data=f,
-                    file_name=os.path.basename(out_path),
-                    mime="application/octet-stream",
-                )
-        except Exception:
-            st.info(
-                "The file has been saved on disk in the `results/` folder. "
-                "If the download button does not work, you can fetch it manually."
+        st.success(f"Saved PCA+LGBM results to: `{out_path}`")
+        with open(out_path, "rb") as f:
+            st.download_button(
+                "⬇️ Download PCA+LGBM results",
+                data=f,
+                file_name=os.path.basename(out_path),
+                mime="application/octet-stream",
             )

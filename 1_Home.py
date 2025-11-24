@@ -4,7 +4,7 @@ import streamlit as st
 
 # Optional: pull config from your training script if it's importable
 try:
-    import _gradientboost as gb  # or gradientboost_train if you used that name
+    import _gradientboost as gb
 
     TICKERS = gb.TICKERS
     START = gb.START
@@ -19,78 +19,84 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🔮 Gradient Boosted Portfolio Lab")
+st.title("🔮 ML Portfolio Lab")
 
 st.markdown(
     """
-This app trains a **gradient-boosted stock selection model** and compares its 
-optimized portfolio against the **S&P 500**, as if you invested \$1000 in each.
+Welcome to your **ML Portfolio Lab**. This app lets you run and compare three
+Masuda-style portfolio models:
 
-Use this home page as your **control panel**, and the results page to **inspect
-saved runs**.
+- 📈 **Gradient Boost (XGBoost / GBM)**  
+- 🌲 **Random Forest**  
+- 🧬 **PCA + LightGBM**  
+
+Each model trains on historical prices, builds a monthly ML-optimized portfolio,
+and compares its performance to an S&P 500 benchmark.
 """
 )
 
 # ------------------------
-# 1. How the workflow works
+# 1. High-level workflow
 # ------------------------
 st.markdown("## 🚦 Workflow Overview")
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.markdown("### 1️⃣ Train the model (offline)")
+    st.markdown("### 1️⃣ Run backtests")
     st.markdown(
         """
-        Run the training script once to:
-        - Download historical prices  
-        - Train the gradient boosting model (GPU-accelerated if available)  
-        - Run the portfolio backtest  
-        - Save everything into a single `.pkl` results file  
+        Go to the **“🧪 Run & Save ML Portfolio Backtests”** page to:
+
+        - Choose a model (GBM, RF, PCA+LGBM)  
+        - Set **start / end dates**  
+        - Adjust **finance parameters**:  
+          - Risk aversion (λ)  
+          - Transaction costs (bps)  
+          - Risk-free rate (for Sharpe)  
+        - Click **Run backtest** to create a timestamped `.pkl` in `results/`.  
         """
-    )
-    st.code(
-        "python _gradientboost.py",
-        language="bash",
-    )
-    st.caption(
-        "You can rename the script if you like—just keep the same main block "
-        "that saves a `gradientboost_results_*.pkl` file in a `results/` folder."
     )
 
 with col2:
-    st.markdown("### 2️⃣ Load results in the dashboard")
+    st.markdown("### 2️⃣ Inspect model results")
     st.markdown(
         """
-        Once a run has finished, you'll have a file like:
-        - `results/gradientboost_results_YYYYMMDD_HHMMSS.pkl`
-        
-        Go to the **“📈 Gradient Boost Portfolio – Backtest Results”** page and:
-        - Upload that `.pkl` file  
-        - View equity curves for 2025 (\$1000 ML vs \$1000 S&P)  
-        - Inspect portfolio weights every 2 months in 2025  
-        - Browse training & testing metrics  
+        Each model has its own results page:
+
+        - 📈 **Gradient Boost Portfolio – Backtest Results**  
+        - 🌲 **Random Forest Portfolio – Backtest Results**  
+        - 🧬 **PCA + LightGBM Portfolio – Results**  
+
+        On each page you can:
+
+        - Plot 2025 **equity curves** (ML vs SPY)  
+        - See **bi-monthly portfolio weights** in 2025  
+        - View a **Trades / Buys / Sells / Holds** table (2024–2025)  
+        - Examine **2-month returns (2024–2025)**  
+        - Compare **train vs test metrics**  
         """
     )
 
 with col3:
-    st.markdown("### 3️⃣ Iterate on design ideas")
+    st.markdown("### 3️⃣ Compare models side-by-side")
     st.markdown(
         """
-        You can experiment with:
-        - Different ticker universes  
-        - Training windows (e.g., 2010–2024)  
-        - Risk-aversion and optimization settings  
-        - Rebalance frequencies and transaction costs  
-        
-        Just update `_gradientboost.py`, rerun training, and upload the new results file.
+        Use the **“⚖️ Model Comparison – GBM vs RF vs PCA+LGBM”** page to:
+
+        - Contrast **bi-monthly ML_Opt returns** across models  
+        - Overlay **2025 equity curves** for all models + SPY  
+        - Compare **test-period performance metrics** (Sharpe, drawdown, etc.)  
+
+        This is your summary view for deciding which model behaves best under
+        your current finance assumptions.
         """
     )
 
 # ------------------------
 # 2. Current configuration
 # ------------------------
-st.markdown("## ⚙️ Current Configuration (from training script)")
+st.markdown("## ⚙️ Current Data & Universe (from training scripts)")
 
 conf_left, conf_right = st.columns(2)
 
@@ -111,81 +117,77 @@ with conf_left:
         )
         st.markdown(
             f"- **Sample window**: `{START}` → `{END}` (default placeholder)\n"
-            "- **Tickers**: unknown (set in your training script)\n"
+            "- **Tickers**: unknown (set in your training scripts)\n"
         )
 
 with conf_right:
-    st.markdown("### Outputs per training run")
+    st.markdown("### What each `.pkl` contains")
 
     st.markdown(
         """
-        Each run of `_gradientboost.py` saves a results dictionary containing:
-        
-        - **`monthly`**: monthly strategy and benchmark returns  
-        - **`weights`**: portfolio weights at each rebalance date  
-        - **`monthly_train` / `monthly_test`**: split returns for train vs test  
-        - **`weights_2025_bimonth`**: weights every 2 months in 2025  
-        - **`equity_2025`**: \$1000 ML portfolio vs \$1000 S&P 500  
-        - **`metrics`**: training/testing performance metrics  
+        Each run of any model script (GBM / RF / PCA+LGBM) saves a results dictionary
+        with at least:
+
+        - **`monthly`**: monthly strategy & benchmark returns  
+        - **`weights`**: portfolio weights at each rebalance  
+        - **`monthly_train` / `monthly_test`**: 2010–2023 vs 2024–2025 split  
+        - **`weights_2025_bimonth`**: bi-monthly weights in 2025  
+        - **`equity_2025`**: $1000 ML portfolio vs $1000 SPY (2025)  
+        - **`metrics`**: train / test performance metrics (Sharpe, drawdown, etc.)  
         """
     )
 
 # ------------------------
-# 3. Quick usage notes
+# 3. Usage notes
 # ------------------------
 st.markdown("## 📝 Usage Notes")
 
 st.markdown(
     textwrap.dedent(
         """
-        - **No auto-retraining in the dashboard**  
-          The Streamlit pages only **load and visualize** saved results. This keeps the UI fast and ensures
-          you don’t accidentally kick off long retraining runs just by refreshing the app.
-        
-        - **GPU acceleration**  
-          If `xgboost` with GPU support is installed, `_gradientboost.py` will automatically use GPU-backed
-          training. If not, it falls back to a standard CPU-based gradient boosting model.
-        
-        - **Multiple runs & versioning**  
-          Each training run writes a new `.pkl` with a timestamp in the filename. You can keep multiple runs
-          side-by-side (e.g., different universes or hyperparameters) and upload whichever one you want
-          to inspect.
+        - **Finance parameters live on the Run Models page**  
+          You control the **economic assumptions** there: risk aversion λ, transaction
+          costs in basis points, and the risk-free rate used for Sharpe. The ML model
+          hyperparameters stay fixed inside the scripts.
+
+        - **No accidental retraining**  
+          The results pages and comparison page only **load and visualize** saved
+          `.pkl` files. A new backtest only runs when you click **Run backtest** on
+          the dedicated page.
+
+        - **Versioning by timestamp**  
+          Each run writes a new file like:
+          `gradientboost_results_YYYYMMDD_HHMMSS.pkl`,
+          `randomforest_results_YYYYMMDD_HHMMSS.pkl`,
+          or `pca_lightgbm_results_YYYYMMDD_HHMMSS.pkl`.  
+          Keep multiple runs side-by-side to compare different universes or
+          finance parameters.
         """
     )
 )
 
 # ------------------------
-# 4. Quick links / navigation hints
+# 4. Navigation hints
 # ------------------------
 st.markdown("## 🧭 Where to go next")
 
 nav_col1, nav_col2 = st.columns(2)
 
 with nav_col1:
-    st.markdown("### ➡️ View saved runs")
+    st.markdown("### ➡️ Run and save new backtests")
     st.markdown(
         """
-        Go to the **“📈 Gradient Boost Portfolio – Backtest Results”** page in the sidebar to:
-        
-        - Upload a `.pkl` results file  
-        - Compare ML vs S&P 500 in 2025  
-        - Inspect portfolio weights and composition over time  
-        - Review training/testing performance metrics  
+        - Open the **“🧪 Run & Save ML Portfolio Backtests”** page  
+        - Pick a model and set finance parameters  
+        - Run a backtest and download the `.pkl` if you want  
         """
     )
 
 with nav_col2:
-    st.markdown("### 🛠 Customize the model")
+    st.markdown("### 📊 Explore results & comparisons")
     st.markdown(
         """
-        Edit `_gradientboost.py` to tweak:
-        
-        - The ticker list (`TICKERS`)  
-        - Date range (`START`, `END`)  
-        - Risk-aversion parameter (`LAMBDA_RISK`)  
-        - Rebalance frequency and transaction cost assumptions  
-        
-        Then rerun:
+        - Use the three model-specific pages (📈 / 🌲 / 🧬) to dive into a single model  
+        - Use **“⚖️ Model Comparison – GBM vs RF vs PCA+LGBM”** to see them together  
         """
     )
-    st.code("python _gradientboost.py", language="bash")

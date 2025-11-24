@@ -1,4 +1,3 @@
-import glob
 import os
 import pickle
 
@@ -6,37 +5,60 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
-
-RESULTS_DIR = "results"
+import yfinance as yf
 
 st.set_page_config(
     page_title="Random Forest Portfolio – Results",
     layout="wide",
 )
 
-st.title("🌲 Random Forest Portfolio – Backtest Results (2024–2025)")
+st.title("🌲 Random Forest Portfolio – Backtest Results")
 
 
-@st.cache_data(show_spinner=False)
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 def load_results_from_bytes(uploaded_file) -> dict:
     return pickle.load(uploaded_file)
 
 
-@st.cache_data(show_spinner=False)
-def load_results_from_path(path: str) -> dict:
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def find_latest_rf_results():
-    pattern = os.path.join(RESULTS_DIR, "randomforest_results_*.pkl")
-    files = glob.glob(pattern)
+def find_latest_results_file(
+    directory: str = "results",
+    prefix: str = "randomforest_results_",
+) -> str | None:
+    """Return path to latest RF results file or None."""
+    if not os.path.isdir(directory):
+        return None
+    files = [
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if f.startswith(prefix) and f.endswith(".pkl")
+    ]
     if not files:
         return None
-    return max(files, key=os.path.getmtime)
+    files.sort()
+    return files[-1]
 
 
-# ====== File upload OR auto-load latest ======
+def format_metrics_table(metrics_dict: dict) -> pd.DataFrame:
+    rows = []
+    for split, models in metrics_dict.items():
+        for model_name, vals in models.items():
+            row = {"split": split, "model": model_name}
+            row.update(vals)
+            rows.append(row)
+    df = pd.DataFrame(rows)
+    return df
+
+
+def two_month_ret(df: pd.DataFrame) -> pd.Series:
+    """Cumulative 2-month return from monthly returns."""
+    return (1.0 + df).prod() - 1.0
+
+
+# ---------------------------------------------------------------------
+# Load results (auto-load latest RF file, optional upload override)
+# ---------------------------------------------------------------------
 st.sidebar.header("Load Saved RF Results")
 
 uploaded = st.sidebar.file_uploader(
@@ -44,143 +66,203 @@ uploaded = st.sidebar.file_uploader(
     type=["pkl"],
 )
 
-latest_path = None
-if uploaded is None:
-    latest_path = find_latest_rf_results()
-
 if uploaded is not None:
     results = load_results_from_bytes(uploaded)
-    st.sidebar.success(f"Using uploaded file: `{uploaded.name}`")
-elif latest_path is not None:
-    results = load_results_from_path(latest_path)
-    st.sidebar.success(
-        f"Auto-loaded latest RF results: `{os.path.basename(latest_path)}`"
-    )
+    st.sidebar.success("Loaded RF results from uploaded file.")
 else:
-    st.info(
-        "👈 Upload a `randomforest_results_*.pkl` file, "
-        "or run a backtest to create one in `results/`."
+    latest_path = find_latest_results_file()
+    if latest_path is None:
+        st.info(
+            "👈 Upload a Random Forest `.pkl` file created by `_randomforest.py`, "
+            "or run a backtest on the **Run Models** page first."
+        )
+        st.stop()
+    with open(latest_path, "rb") as f:
+        results = pickle.load(f)
+    st.sidebar.success(
+        f"Loaded latest RF results file:\n`{os.path.basename(latest_path)}`"
     )
-    st.stop()
 
-ml_curve = results["ml_curve"]
-bench_curve = results["bench_curve"]
-trade_log = results["trade_log"]
-stats_port = results["stats_port"]
-stats_bench = results["stats_bench"]
-train_scores = results["train_scores"]
-tickers = results.get("tickers", [])
-start = results.get("start", "")
-end = results.get("end", "")
-train_end_date = results.get("train_end_date", "")
-backtest_start = results.get("backtest_start", "")
-start_value = results.get("start_value", 1000.0)
+# ---------------------------------------------------------------------
+# Unpack result dictionary
+# ---------------------------------------------------------------------
+prices = results.get("prices")
+monthly = results["monthly"]
+weights = results["weights"]
+monthly_train = results["monthly_train"]
+monthly_test = results["monthly_test"]
+metrics = results["metrics"]
 
-# ====== Top-level info ======
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("Data & Backtest")
-    st.markdown(f"- **Tickers**: {', '.join(tickers)}")
-    st.markdown(f"- **Price sample**: `{start}` → `{end}`")
-    st.markdown(f"- **Train end date**: `{train_end_date}`")
-    st.markdown(f"- **Backtest start**: `{backtest_start}` (RF test window)")
-    st.markdown(f"- **Initial capital**: `${start_value:,.0f}`")
+tickers = results.get(
+    "tickers",
+    list(prices.columns) if prices is not None else list(weights.columns),
+)
+start = results.get(
+    "start",
+    str(prices.index[0].date()) if prices is not None else "",
+)
+end = results.get(
+    "end",
+    str(prices.index[-1].date()) if prices is not None else "",
+)
+model_name = results.get("model_name", "RandomForest")
 
-with col2:
-    st.subheader("Random Forest Model")
+train_start = results.get(
+    "train_start",
+    str(monthly_train.index.min().date()),
+)
+train_end = results.get(
+    "train_end",
+    str(monthly_train.index.max().date()),
+)
+test_start = results.get(
+    "test_start",
+    str(monthly_test.index.min().date()),
+)
+test_end = results.get(
+    "test_end",
+    str(monthly_test.index.max().date()),
+)
+
+initial_investment = float(results.get("initial_investment", 1000.0))
+
+# For weights / trades
+weights_test = weights.loc[test_start:test_end].sort_index()
+
+# ---------------------------------------------------------------------
+# 0. High-level backtest / model info
+# ---------------------------------------------------------------------
+col_info1, col_info2 = st.columns(2)
+
+with col_info1:
+    st.subheader("Backtest Information")
     st.markdown(
-        f"- **Test R²** (post {train_end_date}): "
-        f"`{train_scores.get('r2', np.nan):.4f}`"
+        f"""
+- **Tickers** ({len(tickers)}): {", ".join(tickers)}
+- **Price sample**: `{start}` → `{end}`  
+- **Train window**: `{train_start}` → `{train_end}`  
+- **Test window**: `{test_start}` → `{test_end}`  
+"""
     )
+
+with col_info2:
+    st.subheader("Model Implementation")
     st.markdown(
-        f"- **Test RMSE**: `{train_scores.get('rmse', np.nan):.6f}`"
+        f"""
+- **Model**: {model_name} (cross-sectional, per-month)
+- **Features**: Rolling returns & volatility (same as GBM)
+- **Rebalance frequency**: As defined in training script  
+- **Portfolio construction**: Masuda-style ML optimizer  
+- **Initial test capital**: `${int(initial_investment):,}`  
+"""
     )
-    st.markdown(
-        """
-        - **Features**: short/long momentum & volatility  
-        - **Signals**: daily, top-5 stocks by predicted next-day return  
-        - **Backtest window**: 2024–2025  
-        """
-    )
 
-# ====== 1. Equity curves RF vs SPY ======
-st.markdown("## 1. Equity Curves – RF Strategy vs SPY")
+st.markdown("---")
 
-eq_df = pd.concat(
-    [ml_curve.rename("RF Strategy"), bench_curve.rename("SPY")],
-    axis=1,
-).reset_index().rename(columns={"index": "Date"})
+# ---------------------------------------------------------------------
+# 1. 2024–2025 Equity Curves – RF vs SPY (test window)
+# ---------------------------------------------------------------------
+st.markdown(
+    f"## 1. 2024–2025 Equity Curves – RF Strategy vs SPY "
+    f"(initial = ${int(initial_investment):,})"
+)
 
-eq_long = eq_df.melt("Date", var_name="Series", value_name="Equity")
+eq_df = pd.DataFrame(index=monthly_test.index)
+
+# ML_Opt equity
+if "ML_Opt" in monthly_test.columns:
+    ml_equity = initial_investment * (1.0 + monthly_test["ML_Opt"]).cumprod()
+    eq_df[f"RF_ML_Opt_${int(initial_investment)}"] = ml_equity
+
+# ---- SPY equity curve over full test window (2024–2025) ----
+spy_series = None
+
+# 1) Try to use a SPY return column if it exists
+spy_cols = [c for c in monthly_test.columns if "SPY" in c.upper()]
+if spy_cols:
+    spy_ret = monthly_test[spy_cols[0]]
+    spy_series = initial_investment * (1.0 + spy_ret).cumprod()
+else:
+    # 2) Otherwise, download SPY prices and build an equity curve
+    spy_px = yf.download(
+        "SPY",
+        start=test_start,
+        end=(pd.to_datetime(test_end) + pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
+        auto_adjust=True,
+        progress=False,
+    )["Close"].dropna()
+
+    if not spy_px.empty:
+        spy_equity_daily = initial_investment * spy_px / spy_px.iloc[0]
+        spy_series = spy_equity_daily.resample("M").last()
+        spy_series = spy_series.reindex(eq_df.index).ffill()
+
+if spy_series is not None:
+    eq_df[f"SPY_${int(initial_investment)}"] = spy_series
+
+eq_df = eq_df.dropna(how="all")
+
+eq_long = (
+    eq_df.reset_index()
+    .rename(columns={"index": "Date"})
+    .melt("Date", var_name="Series", value_name="Equity")
+)
 
 chart_equity = (
     alt.Chart(eq_long)
     .mark_line()
     .encode(
         x=alt.X("Date:T", title="Date"),
-        y=alt.Y("Equity:Q", title="Portfolio value ($)", scale=alt.Scale(nice=True)),
-        color=alt.Color("Series:N", title="Strategy"),
-        tooltip=["Date:T", "Series:N", alt.Tooltip("Equity:Q", format=".2f")],
+        y=alt.Y(
+            "Equity:Q",
+            title="Portfolio value ($)",
+            scale=alt.Scale(zero=False),  # zoom on curves
+            axis=alt.Axis(format="~s"),
+        ),
+        color=alt.Color("Series:N", title="Series"),
+        tooltip=[
+            "Date:T",
+            "Series:N",
+            alt.Tooltip("Equity:Q", format=",.2f"),
+        ],
     )
     .properties(height=350)
     .interactive()
 )
 st.altair_chart(chart_equity, use_container_width=True)
 
-st.markdown(
-    f"**Final RF value**: `${ml_curve.iloc[-1]:,.2f}` &nbsp;&nbsp; "
-    f"**Final SPY value**: `${bench_curve.iloc[-1]:,.2f}`"
+st.caption(
+    "Equity curves are computed from **monthly_test** returns over the full test "
+    "window (2024–2025), scaled by the chosen initial capital."
 )
 
-# ====== 2. Portfolio Weights – Testing Window (2024–current) ======
-st.markdown("## 2. Portfolio Weights – Testing Window (2024–current)")
+# ---------------------------------------------------------------------
+# 2. Portfolio Weights – Bi-monthly Snapshots (2024–2025)
+# ---------------------------------------------------------------------
+st.markdown("## 2. Portfolio Weights – Bi-monthly Snapshots (2024–2025)")
 
-tl = trade_log.copy()
-tl["date"] = pd.to_datetime(tl["date"])
-tl = tl.set_index("date").sort_index()
-tl = tl.loc["2024-01-01":]
+weights_test_bimonth = weights_test.iloc[::2]
+weights_test_bimonth.index.name = "Date"
 
-all_dates = tl.index
-all_tickers = sorted({tk for lst in tl["chosen_stocks"] for tk in lst})
-weights_df = pd.DataFrame(0.0, index=all_dates, columns=all_tickers)
-
-for dt, row in tl.iterrows():
-    chosen = row["chosen_stocks"]
-    if not chosen:
-        continue
-    w = 1.0 / len(chosen)
-    weights_df.loc[dt, chosen] = w
-
-weights_2m = (
-    weights_df
-    .resample("2M")
-    .last()
-    .dropna(how="all")
-)
-
-weights_2m_table = weights_2m.copy()
-weights_2m_table.index = weights_2m_table.index.strftime("%Y-%m-%d")
-
-st.markdown("### 2.1 Weight Table (Bi-monthly, RF Test Window)")
+st.markdown("### 2.1 Raw weight table (every 2 months in test window)")
 st.dataframe(
-    weights_2m_table.style.format("{:.2%}"),
+    weights_test_bimonth.style.format("{:.2%}"),
     use_container_width=True,
 )
 
 st.markdown("### 2.2 Weight Composition Chart (Bi-monthly)")
 
 weights_long = (
-    weights_2m
+    weights_test_bimonth
     .reset_index()
-    .melt("date", var_name="Ticker", value_name="Weight")
-    .rename(columns={"date": "Date"})
+    .melt("Date", var_name="Ticker", value_name="Weight")
 )
 
 chart_weights = (
     alt.Chart(weights_long)
     .mark_area()
     .encode(
-        x=alt.X("Date:T", title="Signal Date"),
+        x=alt.X("Date:T", title="Rebalance Date"),
         y=alt.Y("Weight:Q", stack="normalize", title="Weight"),
         color=alt.Color("Ticker:N", title="Ticker"),
         tooltip=[
@@ -194,44 +276,81 @@ chart_weights = (
 )
 st.altair_chart(chart_weights, use_container_width=True)
 
-# ====== 3. Test Returns every 2 Months (2024–current) ======
-st.markdown("## 3. Test Returns – Every 2 Months (2024–current)")
+# ---------------------------------------------------------------------
+# 3. Trades / Buys / Sells / Holds (Monthly Rebalance)
+# ---------------------------------------------------------------------
+st.markdown("## 3. Trades / Buys / Sells / Holds (Monthly Rebalance)")
 
-ml_ret = ml_curve.pct_change().dropna()
-spy_ret = bench_curve.pct_change().dropna()
+rows = []
+prev_nonzero = set()
 
-ml_ret_24 = ml_ret.loc["2024-01-01":]
-spy_ret_24 = spy_ret.loc["2024-01-01":]
+for dt, row in weights_test.iterrows():
+    current_nonzero = set(row[row > 0].index.tolist())
+    buys = sorted(current_nonzero - prev_nonzero)
+    sells = sorted(prev_nonzero - current_nonzero)
+    holds = sorted(current_nonzero & prev_nonzero)
 
-def two_month_ret(series):
-    return (1.0 + series).prod() - 1.0
+    rows.append(
+        {
+            "Date": dt,
+            "current_stocks": sorted(current_nonzero),
+            "buys": buys,
+            "sells": sells,
+            "holds": holds,
+        }
+    )
+    prev_nonzero = current_nonzero
 
-rf_2m = ml_ret_24.resample("2M").apply(two_month_ret)
-spy_2m = spy_ret_24.resample("2M").apply(two_month_ret)
+trade_log = pd.DataFrame(rows)
+if not trade_log.empty:
+    trade_log["Date"] = pd.to_datetime(trade_log["Date"])
 
-ret_2m_df = pd.concat(
-    [rf_2m.rename("RF Strategy"), spy_2m.rename("SPY")],
-    axis=1
-).dropna(how="all")
+max_rows = st.slider(
+    "Rows to display",
+    min_value=10,
+    max_value=len(trade_log) if not trade_log.empty else 10,
+    value=min(100, len(trade_log)) if not trade_log.empty else 10,
+)
+st.dataframe(
+    trade_log.tail(max_rows),
+    use_container_width=True,
+)
 
-ret_2m_long = (
-    ret_2m_df
-    .reset_index()
-    .melt("index", var_name="Series", value_name="Return")
-    .rename(columns={"index": "Date"})
+# ---------------------------------------------------------------------
+# 4. 2-Month Cumulative Returns – Test Period (2024–2025)
+# ---------------------------------------------------------------------
+st.markdown("## 4. 2-Month Cumulative Returns – Test Period (2024–2025)")
+
+test_2024 = monthly_test.loc["2024-01-01":]
+
+cols_for_bar = [c for c in ["ML_Opt", "EqualWeight"] if c in test_2024.columns]
+returns_2m = (
+    test_2024[cols_for_bar]
+    .resample("2M")
+    .apply(two_month_ret)
+    .dropna(how="all")
+)
+
+returns_2m_long = (
+    returns_2m.reset_index()
+    .melt("Date", var_name="Strategy", value_name="Return")
 )
 
 chart_ret_2m = (
-    alt.Chart(ret_2m_long)
+    alt.Chart(returns_2m_long)
     .mark_bar()
     .encode(
         x=alt.X("Date:T", title="Period Start"),
-        y=alt.Y("Return:Q", title="2-month return", axis=alt.Axis(format="%")),
-        color=alt.Color("Series:N", title="Series"),
+        y=alt.Y(
+            "Return:Q",
+            title="2-month return",
+            axis=alt.Axis(format="%"),
+        ),
+        color=alt.Color("Strategy:N", title="Strategy"),
         tooltip=[
             "Date:T",
-            "Series:N",
-            alt.Tooltip("Return:Q", format=".2%"),  # 2 decimal percent
+            "Strategy:N",
+            alt.Tooltip("Return:Q", format=".2%"),
         ],
     )
     .properties(height=350)
@@ -240,59 +359,37 @@ chart_ret_2m = (
 st.altair_chart(chart_ret_2m, use_container_width=True)
 
 st.dataframe(
-    ret_2m_df.style.format("{:.2%}"),
+    returns_2m.style.format("{:.2%}"),
     use_container_width=True,
 )
 
-# ====== 4. Performance metrics ======
-st.markdown("## 4. Performance Metrics")
+# ---------------------------------------------------------------------
+# 5. Performance Metrics – Train vs Test
+# ---------------------------------------------------------------------
+st.markdown("## 5. Performance Metrics – Train vs Test")
 
-metrics_rows = [
-    {"portfolio": "RF Strategy", **stats_port},
-    {"portfolio": "SPY", **stats_bench},
-]
-metrics_df = pd.DataFrame(metrics_rows)
+metrics_df = format_metrics_table(metrics)
 
 metrics_display = metrics_df.copy()
-for col in ["Annualized return", "Annualized vol", "Max drawdown"]:
+for col in ["total_return", "ann_return", "ann_vol", "sharpe", "max_drawdown"]:
     if col in metrics_display.columns:
-        metrics_display[col] = metrics_display[col].map(
-            lambda x: f"{x:.2%}" if pd.notnull(x) else ""
-        )
-if "Sharpe (rf=0)" in metrics_display.columns:
-    metrics_display["Sharpe (rf=0)"] = metrics_display["Sharpe (rf=0)"].map(
-        lambda x: f"{x:.2f}" if pd.notnull(x) else ""
-    )
+        if col == "sharpe":
+            metrics_display[col] = metrics_display[col].map(
+                lambda x: f"{x:.2f}" if pd.notnull(x) else ""
+            )
+        else:
+            metrics_display[col] = metrics_display[col].map(
+                lambda x: f"{x:.2%}" if pd.notnull(x) else ""
+            )
 
 st.dataframe(metrics_display, use_container_width=True)
 
 st.markdown(
     """
-    - **Annualized return / vol** computed from daily log-returns.  
-    - **Sharpe (rf=0)** uses a zero risk-free rate for simplicity.  
-    - **Max drawdown** is the worst peak-to-trough loss over the backtest.
-    """
-)
-
-# ====== 5. Trade log ======
-st.markdown("## 5. Trade Log (Daily Selections)")
-
-st.caption(
-    "Each row shows the ML-selected portfolio for that day along with which "
-    "stocks were bought, sold, or held relative to the previous day."
-)
-
-trade_log_24 = trade_log.copy()
-trade_log_24["date"] = pd.to_datetime(trade_log_24["date"])
-trade_log_24 = trade_log_24[trade_log_24["date"] >= "2024-01-01"]
-
-max_rows = st.slider(
-    "Rows to display",
-    min_value=50,
-    max_value=len(trade_log_24),
-    value=min(200, len(trade_log_24)),
-)
-st.dataframe(
-    trade_log_24.tail(max_rows),
-    use_container_width=True,
+- **total_return**: cumulative return over the period.  
+- **ann_return**: annualized return.  
+- **ann_vol**: annualized volatility.  
+- **sharpe**: annualized Sharpe ratio.  
+- **max_drawdown**: maximum drawdown from peak to trough.
+"""
 )

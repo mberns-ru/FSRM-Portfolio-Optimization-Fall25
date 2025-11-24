@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+import yfinance as yf
 
 RESULTS_DIR = "results"
 
@@ -29,8 +30,13 @@ def load_results_from_path(path: str) -> dict:
 
 
 def find_latest_pl_results():
-    pattern = os.path.join(RESULTS_DIR, "pca_lightgbm_results_*.pkl")
-    files = glob.glob(pattern)
+    if not os.path.isdir(RESULTS_DIR):
+        return None
+    files = [
+        os.path.join(RESULTS_DIR, f)
+        for f in os.listdir(RESULTS_DIR)
+        if f.startswith("pca_lightgbm_results_") and f.endswith(".pkl")
+    ]
     if not files:
         return None
     return max(files, key=os.path.getmtime)
@@ -44,6 +50,10 @@ def format_metrics_table(metrics_dict: dict) -> pd.DataFrame:
             row.update(vals)
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+def two_month_ret(df_slice: pd.DataFrame) -> pd.Series:
+    return (1.0 + df_slice).prod() - 1.0
 
 
 # ====== File upload OR auto-load latest ======
@@ -73,18 +83,44 @@ else:
     )
     st.stop()
 
+# ---------------------------------------------------------------------
+# Unpack
+# ---------------------------------------------------------------------
 monthly = results["monthly"]
 weights = results["weights"]
 monthly_train = results["monthly_train"]
 monthly_test = results["monthly_test"]
-weights_2025_bimonth = results["weights_2025_bimonth"]
-equity_compare_2025 = results["equity_compare_2025"]
 metrics = results["metrics"]
+
 use_lightgbm = results.get("use_lightgbm", False)
 prices = results.get("prices", None)
-tickers = results.get("tickers", list(weights.columns))
+tickers = results.get(
+    "tickers",
+    list(prices.columns) if prices is not None else list(weights.columns),
+)
 start = results.get("start", "")
 end = results.get("end", "")
+
+train_start = results.get(
+    "train_start",
+    str(monthly_train.index.min().date()),
+)
+train_end = results.get(
+    "train_end",
+    str(monthly_train.index.max().date()),
+)
+test_start = results.get(
+    "test_start",
+    str(monthly_test.index.min().date()),
+)
+test_end = results.get(
+    "test_end",
+    str(monthly_test.index.max().date()),
+)
+
+initial_investment = float(results.get("initial_investment", 1000.0))
+
+weights_test = weights.loc[test_start:test_end].sort_index()
 
 # ====== Top-level info ======
 col_info1, col_info2 = st.columns(2)
@@ -93,32 +129,57 @@ with col_info1:
     st.markdown(f"- **Tickers**: {', '.join(map(str, tickers))}")
     st.markdown(f"- **Price sample**: `{start}` → `{end}`")
     st.markdown(
-        f"- **Train window**: {monthly_train.index.min().date()} → "
-        f"{monthly_train.index.max().date()}"
+        f"- **Train window**: `{train_start}` → `{train_end}`"
     )
     st.markdown(
-        f"- **Test window**: {monthly_test.index.min().date()} → "
-        f"{monthly_test.index.max().date()}"
+        f"- **Test window**: `{test_start}` → `{test_end}`"
     )
 
 with col_info2:
     st.subheader("Model Implementation")
     st.markdown(f"- **Uses LightGBM**: `{use_lightgbm}`")
     st.markdown("- **Dimensionality reduction**: PCA on standardized features")
-    st.markdown("- **Rebalance frequency**: Monthly")
+    st.markdown("- **Rebalance frequency**: as set in training script")
     st.markdown("- **Portfolio construction**: Mean-variance + cluster penalties")
+    st.markdown(
+        f"- **Initial test capital**: `${int(initial_investment):,}`"
+    )
 
-
-# ====== 1. Equity Curves – PCA+LGBM vs SPY (2025, $1000) ======
-st.markdown("## 1. Equity Curves – PCA+LGBM vs SPY (2025, $1000)")
-
-eq_df = equity_compare_2025.copy()
-eq_df = eq_df.rename(
-    columns={
-        "ML_Opt_$1000": "PCA+LGBM Strategy",
-        "SPY_$1000": "SPY",
-    }
+# ====== 1. Equity Curves – PCA+LGBM vs SPY (2024–2025) ======
+st.markdown(
+    f"## 1. Equity Curves – PCA+LGBM vs SPY "
+    f"(2024–2025, initial = ${int(initial_investment):,})"
 )
+
+eq_df = pd.DataFrame(index=monthly_test.index)
+
+if "ML_Opt" in monthly_test.columns:
+    ml_equity = initial_investment * (1.0 + monthly_test["ML_Opt"]).cumprod()
+    eq_df[f"PCA+LGBM_ML_Opt_${int(initial_investment)}"] = ml_equity
+
+spy_series = None
+
+spy_cols = [c for c in monthly_test.columns if "SPY" in c.upper()]
+if spy_cols:
+    spy_ret = monthly_test[spy_cols[0]]
+    spy_series = initial_investment * (1.0 + spy_ret).cumprod()
+else:
+    spy_px = yf.download(
+        "SPY",
+        start=test_start,
+        end=(pd.to_datetime(test_end) + pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
+        auto_adjust=True,
+        progress=False,
+    )["Close"].dropna()
+    if not spy_px.empty:
+        spy_equity_daily = initial_investment * spy_px / spy_px.iloc[0]
+        spy_series = spy_equity_daily.resample("M").last()
+        spy_series = spy_series.reindex(eq_df.index).ffill()
+
+if spy_series is not None:
+    eq_df[f"SPY_${int(initial_investment)}"] = spy_series
+
+eq_df = eq_df.dropna(how="all")
 
 eq_long = (
     eq_df.reset_index()
@@ -131,7 +192,7 @@ chart_eq = (
     .mark_line()
     .encode(
         x=alt.X("Date:T", title="Date"),
-        y=alt.Y("Equity:Q", title="Portfolio Value ($)"),
+        y=alt.Y("Equity:Q", title="Portfolio Value ($)", scale=alt.Scale(zero=False)),
         color=alt.Color("Series:N", title="Series"),
         tooltip=[
             "Date:T",
@@ -145,10 +206,10 @@ chart_eq = (
 
 st.altair_chart(chart_eq, use_container_width=True)
 
-# ====== 2. Portfolio Weights – Bi-monthly Snapshots (2025) ======
-st.markdown("## 2. Portfolio Weights – Bi-monthly Snapshots (2025)")
+# ====== 2. Portfolio Weights – Bi-monthly Snapshots (Test Window) ======
+st.markdown("## 2. Portfolio Weights – Bi-monthly Snapshots (Test Window)")
 
-weights_test_bimonth = weights_2025_bimonth.copy()
+weights_test_bimonth = weights_test.iloc[::2]
 weights_test_bimonth.index.name = "Date"
 
 weights_table = weights_test_bimonth.copy()
@@ -186,16 +247,13 @@ chart_weights = (
 )
 st.altair_chart(chart_weights, use_container_width=True)
 
-
-# ====== 3. Trade Log – RF-style (Monthly Selections) ======
+# ====== 3. Trade Log – reconstructed from weights ======
 st.markdown("## 3. Trade Log (Monthly Selections)")
 
 st.caption(
     "Approximate trade log reconstructed from monthly weights: "
     "which assets are in the portfolio, and which are bought/sold at each rebalance."
 )
-
-weights_test = weights.loc["2024-01-01":"2025-12-31"].sort_index()
 
 rows = []
 prev_nonzero = set()
@@ -230,17 +288,14 @@ st.dataframe(
     use_container_width=True,
 )
 
-
 # ====== 4. Test Returns every 2 Months (2024–2025) ======
 st.markdown("## 4. Test Returns – Every 2 Months (2024–2025)")
 
 test_2024 = monthly_test.loc["2024-01-01":]
 
-def two_month_ret(df_slice: pd.DataFrame) -> pd.Series:
-    return (1.0 + df_slice).prod() - 1.0
-
+cols_for_bar = [c for c in ["ML_Opt", "EqualWeight"] if c in test_2024.columns]
 returns_2m = (
-    test_2024[["ML_Opt", "EqualWeight"]]
+    test_2024[cols_for_bar]
     .resample("2M")
     .apply(two_month_ret)
     .dropna(how="all")
@@ -256,7 +311,7 @@ chart_ret_2m = (
     .mark_bar()
     .encode(
         x=alt.X("Date:T", title="Period Start"),
-        y=alt.Y("Return:Q", title="2-month return"),
+        y=alt.Y("Return:Q", title="2-month return", axis=alt.Axis(format="%")),
         color=alt.Color("Strategy:N", title="Strategy"),
         tooltip=[
             "Date:T",
@@ -275,7 +330,6 @@ st.dataframe(
     returns_2m_table.style.format("{:.2%}"),
     use_container_width=True,
 )
-
 
 # ====== 5. Performance Metrics – Train vs Test ======
 st.markdown("## 5. Performance Metrics – Train vs Test")

@@ -86,29 +86,38 @@ except ImportError:
 # User Settings
 # =====================
 
+# Core investable universe
 TICKERS = [
     "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "BRK-B", "JNJ", "JPM", "XOM",
     "V", "PG", "MA", "HD", "CVX", "UNH", "MRK", "KO", "PEP", "ABBV",
     "AVGO", "NFLX", "ADBE", "ORCL", "CSCO",
 ]
 
-# Train+backtest from 2010 onwards
+# Price history range (can be overridden from Streamlit)
 START = "2010-01-01"
 END = None  # None = today
 
-REBAL_FREQ = "M"         # Monthly rebalance; we'll *report* every 2 months
+# Train / test split (can be overridden from Streamlit)
+TRAIN_START = "2010-01-01"
+TRAIN_END   = "2023-12-31"
+TEST_START  = "2024-01-01"
+TEST_END    = "2025-12-31"
+
+# Rebalance frequency (M = monthly, Q = quarterly; overridable)
+REBAL_FREQ = "M"         # we'll *report* every 2 months on results pages
 LOOKBACK_DAYS = 252      # ~1Y lookback for features/covariance
 TRAIN_MIN_MONTHS = 36    # Require ~3 years before first trade
 
-# Optimization hyperparameters (simple mean-variance)
+# Portfolio optimization “finance” knobs
 LAMBDA_RISK = 5.0        # risk aversion
 N_CLUSTERS = 5           # for clustering
-
-# Backtest settings
 TC_BPS = 5               # transaction cost (bps) per $ turnover (e.g., 5 = 0.05%)
-RISK_FREE_ANNUAL = 0.015 # for Sharpe if you want to compute it later
+RISK_FREE_ANNUAL = 0.015 # for Sharpe etc.
 
-RESULTS_DIR = "results"  # where we save pickled results
+# Initial capital used for test-period equity curves
+INITIAL_INVESTMENT = 1000.0
+
+RESULTS_DIR = "results"
 
 
 # =====================
@@ -433,45 +442,67 @@ def run_backtest(prices: pd.DataFrame, store_weights: bool = False):
 
 def build_results(prices: pd.DataFrame) -> dict:
     """
-    Runs the full backtest, builds benchmark and metrics,
-    and returns a dict suitable for saving to disk and reloading in Streamlit.
+    Wraps the Masuda-style backtest into a dict that Streamlit pages can consume.
 
-    Train window: 2010–2023
-    Test window:  2024–2025
-    Benchmark:    SPY ($1000 buy-and-hold from 2025-01-01)
+    Train window: TRAIN_START–TRAIN_END
+    Test window:  TEST_START–TEST_END
+    Benchmark:    SPY (equity curve scaled to INITIAL_INVESTMENT from TEST_START)
     """
     monthly, weights = run_backtest(prices, store_weights=True)
 
     # ---- Train / Test split ----
-    monthly_train = monthly.loc["2010-01-01":"2023-12-31"]
-    monthly_test = monthly.loc["2024-01-01":"2025-12-31"]
+    monthly_train = monthly.loc[TRAIN_START:TRAIN_END]
+    monthly_test = monthly.loc[TEST_START:TEST_END]
 
-    # Portfolio composition: every 2 months in 2025
-    weights_2025 = weights.loc["2025-01-01":"2025-12-31"]
-    weights_2025_bimonth = weights_2025.sort_index().iloc[::2]
+    # ---- Portfolio composition every 2 months in the *test* window (2024–2025) ----
+    weights_test = weights.loc[TEST_START:TEST_END]
+    weights_test_bimonth = weights_test.sort_index().iloc[::2]
 
-    # SPY benchmark: $1000 invested on 2025-01-01
+    # ---- SPY benchmark equity curve over the *entire* test window ----
+    # We still download daily SPY prices, but anchor them at TEST_START.
+    spy_start = TEST_START
+    # give a little buffer beyond TEST_END
+    spy_end = (pd.to_datetime(TEST_END) + relativedelta(days=10)).strftime("%Y-%m-%d")
+
     bench_px = yf.download(
         "SPY",
-        start="2025-01-01",
-        end="2026-01-01",
+        start=spy_start,
+        end=spy_end,
         auto_adjust=True,
         progress=False,
     )["Close"].dropna()
 
+    if bench_px.empty:
+        raise RuntimeError("No SPY data downloaded for benchmark.")
+
     bench_initial = bench_px.iloc[0]
-    bench_equity = 1000.0 * bench_px / bench_initial
+    bench_equity = INITIAL_INVESTMENT * bench_px / bench_initial
     bench_equity_m = bench_equity.resample("M").last()
-    bench_equity_m.name = "SPY_$1000"
+    # align to the test-period months
+    bench_equity_m = bench_equity_m.loc[monthly_test.index.min():monthly_test.index.max()]
+    bench_equity_m.name = f"SPY_${int(INITIAL_INVESTMENT)}"
 
-    # Only 2025 ML returns for the equity curve vs SPY
+    # ---- ML equity curve over the test window ----
+    ml_equity_test = INITIAL_INVESTMENT * (1.0 + monthly_test["ML_Opt"]).cumprod()
+    ml_equity_test.index = monthly_test.index
+    ml_equity_test.name = f"ML_Opt_${int(INITIAL_INVESTMENT)}"
+
+    equity_test = pd.concat([ml_equity_test, bench_equity_m], axis=1).dropna()
+
+    # ---- Optional 2025-only equity for backward compatibility ----
     ml_ret_2025 = monthly.loc["2025-01-01":"2025-12-31"]["ML_Opt"]
-    ml_equity = 1000.0 * (1.0 + ml_ret_2025).cumprod()
-    ml_equity.name = "ML_Opt_$1000"
+    if not ml_ret_2025.empty:
+        ml_equity_2025 = INITIAL_INVESTMENT * (1.0 + ml_ret_2025).cumprod()
+        ml_equity_2025.name = f"ML_Opt_${int(INITIAL_INVESTMENT)}"
 
-    equity_compare_2025 = pd.concat([ml_equity, bench_equity_m], axis=1).dropna()
+        bench_equity_2025 = bench_equity.loc["2025-01-01":"2025-12-31"].resample("M").last()
+        bench_equity_2025.name = f"SPY_${int(INITIAL_INVESTMENT)}"
 
-    # Performance metrics (train = 2010–2023, test = 2024–2025)
+        equity_2025 = pd.concat([ml_equity_2025, bench_equity_2025], axis=1).dropna()
+    else:
+        equity_2025 = equity_test.copy()
+
+    # ---- Performance metrics (train = TRAIN, test = TEST) ----
     metrics = {
         "train": {
             "ML_Opt": compute_perf_metrics(monthly_train["ML_Opt"]),
@@ -489,33 +520,21 @@ def build_results(prices: pd.DataFrame) -> dict:
         "weights": weights,
         "monthly_train": monthly_train,
         "monthly_test": monthly_test,
-        "weights_2025_bimonth": weights_2025_bimonth,
-        "equity_2025": equity_compare_2025,
+        # new: test-window bi-monthly weights and equity
+        "weights_test_bimonth": weights_test_bimonth,
+        "equity_test": equity_test,
+        # kept for backward compatibility
+        "weights_2025_bimonth": weights_test.loc["2025-01-01":"2025-12-31"].sort_index().iloc[::2],
+        "equity_2025": equity_2025,
         "metrics": metrics,
         "tickers": TICKERS,
         "start": START,
         "end": END,
         "use_xgb": USE_XGB,
+        "train_start": TRAIN_START,
+        "train_end": TRAIN_END,
+        "test_start": TEST_START,
+        "test_end": TEST_END,
+        "initial_investment": float(INITIAL_INVESTMENT),
     }
     return results
-
-def save_results(results: dict, directory: str = RESULTS_DIR) -> str:
-    os.makedirs(directory, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = os.path.join(directory, f"gradientboost_results_{ts}.pkl")
-    with open(fname, "wb") as f:
-        pickle.dump(results, f)
-    return fname
-
-
-if __name__ == "__main__":
-    print("Downloading prices…")
-    px = download_prices(TICKERS, START, END)
-    print(f"Got {px.shape[1]} tickers, {px.shape[0]} rows of prices.")
-
-    print("Running backtest (this can take a bit)…")
-    results_dict = build_results(px)
-
-    out_path = save_results(results_dict, RESULTS_DIR)
-    print(f"Saved results to: {out_path}")
-    print("Done.")
