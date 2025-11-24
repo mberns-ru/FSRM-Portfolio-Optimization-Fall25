@@ -538,3 +538,36 @@ def build_results(prices: pd.DataFrame) -> dict:
         "initial_investment": float(INITIAL_INVESTMENT),
     }
     return results
+
+def save_results(results: dict, directory: str = RESULTS_DIR) -> str:
+    """
+    Save the Gradient Boost backtest results to a timestamped pickle file.
+
+    This matches the interface used by the other model modules so that the
+    Streamlit `Run Models` page can call `gb.save_results(...)`.
+    """
+    os.makedirs(directory, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = os.path.join(directory, f"gradientboost_results_{ts}.pkl")
+    with open(fname, "wb") as f:
+        pickle.dump(results, f)
+    return fname
+
+
+def main():
+    """Convenience CLI entry point for running the GBM backtest offline."""
+    print("Downloading prices…")
+    px = download_prices(TICKERS, START, END)
+    print(f"Got {px.shape[1]} tickers, {px.shape[0]} rows of prices.")
+
+    print("Running Gradient Boost monthly backtest (Masuda-style)…")
+    results = build_results(px)
+
+    out_path = save_results(results, RESULTS_DIR)
+    print(f"Saved GBM results to: {out_path}")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
+

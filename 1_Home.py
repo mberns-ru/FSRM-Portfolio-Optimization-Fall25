@@ -1,11 +1,9 @@
 import textwrap
-
 import streamlit as st
 
-# Optional: pull config from your training script if it's importable
+# Optional: pull config from your GBM training script if it's importable
 try:
     import _gradientboost as gb
-
     TICKERS = gb.TICKERS
     START = gb.START
     END = gb.END
@@ -15,7 +13,7 @@ except Exception:
     END = "2025-12-31"
 
 st.set_page_config(
-    page_title="Gradient Boosted Portfolio Lab",
+    page_title="ML Portfolio Lab",
     layout="wide",
 )
 
@@ -23,15 +21,16 @@ st.title("🔮 ML Portfolio Lab")
 
 st.markdown(
     """
-Welcome to your **ML Portfolio Lab**. This app lets you run and compare three
-Masuda-style portfolio models:
+Welcome to your **ML Portfolio Lab**.  
+This app now supports **four full Masuda-style ML portfolio models**:
 
 - 📈 **Gradient Boost (XGBoost / GBM)**  
 - 🌲 **Random Forest**  
 - 🧬 **PCA + LightGBM**  
+- 🐈 **CatBoost**  
 
-Each model trains on historical prices, builds a monthly ML-optimized portfolio,
-and compares its performance to an S&P 500 benchmark.
+Each model trains on historical prices, constructs monthly ML-optimized portfolios,
+and compares performance to the **S&P 500 benchmark**.
 """
 )
 
@@ -40,56 +39,69 @@ and compares its performance to an S&P 500 benchmark.
 # ------------------------
 st.markdown("## 🚦 Workflow Overview")
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     st.markdown("### 1️⃣ Run backtests")
     st.markdown(
         """
-        Go to the **“🧪 Run & Save ML Portfolio Backtests”** page to:
+        Visit **“🧪 Run & Save ML Portfolio Backtests”** to:
 
-        - Choose a model (GBM, RF, PCA+LGBM)  
+        - Choose a model:  
+          - GBM  
+          - Random Forest  
+          - PCA + LightGBM  
+          - CatBoost  
         - Set **start / end dates**  
-        - Adjust **finance parameters**:  
-          - Risk aversion (λ)  
-          - Transaction costs (bps)  
-          - Risk-free rate (for Sharpe)  
-        - Click **Run backtest** to create a timestamped `.pkl` in `results/`.  
+        - Adjust **finance parameters** (λ, transaction costs, risk-free rate)  
+        - Run and save `.pkl` result files  
         """
     )
 
 with col2:
-    st.markdown("### 2️⃣ Inspect model results")
+    st.markdown("### 2️⃣ Inspect results per model")
     st.markdown(
         """
-        Each model has its own results page:
+        Each model has its own dedicated results page:
 
-        - 📈 **Gradient Boost Portfolio – Backtest Results**  
-        - 🌲 **Random Forest Portfolio – Backtest Results**  
-        - 🧬 **PCA + LightGBM Portfolio – Results**  
+        - 📈 **Gradient Boost – Backtest Results**  
+        - 🌲 **Random Forest – Backtest Results**  
+        - 🧬 **PCA + LightGBM – Results**  
+        - 🐈 **CatBoost – Backtest Results**  
 
-        On each page you can:
+        Explore:
 
-        - Plot 2025 **equity curves** (ML vs SPY)  
-        - See **bi-monthly portfolio weights** in 2025  
-        - View a **Trades / Buys / Sells / Holds** table (2024–2025)  
-        - Examine **2-month returns (2024–2025)**  
-        - Compare **train vs test metrics**  
+        - 2025 **equity curves** (ML vs SPY)  
+        - **Bi-monthly weights** in 2025  
+        - **Trades / Buys / Sells / Holds** (2024–2025)  
+        - **2-month returns** (2024–2025)  
+        - **Train vs Test metrics**  
         """
     )
 
 with col3:
-    st.markdown("### 3️⃣ Compare models side-by-side")
+    st.markdown("### 3️⃣ Compare all 4 models")
     st.markdown(
         """
-        Use the **“⚖️ Model Comparison – GBM vs RF vs PCA+LGBM”** page to:
+        Use **“⚖️ Model Comparison – GBM vs RF vs PCA+LGBM vs CatBoost”** to:
 
-        - Contrast **bi-monthly ML_Opt returns** across models  
-        - Overlay **2025 equity curves** for all models + SPY  
-        - Compare **test-period performance metrics** (Sharpe, drawdown, etc.)  
+        - Overlay **2025 equity curves** for all 4 models + SPY  
+        - Compare **test-period Sharpe, vol, drawdown**  
+        - View **side-by-side ML_Opt returns**  
+        - Evaluate stability of each model’s ML strategy  
+        """
+    )
 
-        This is your summary view for deciding which model behaves best under
-        your current finance assumptions.
+with col4:
+    st.markdown("### 4️⃣ Iterate with new ideas")
+    st.markdown(
+        """
+        Experiment with:
+
+        - New hyperparameters inside each training script  
+        - Different risk-aversion λ and transaction costs  
+        - Alternate universes of tickers  
+        - Different date ranges (longer or shorter memory)  
         """
     )
 
@@ -113,27 +125,27 @@ with conf_left:
     else:
         st.warning(
             "Could not import `_gradientboost`. "
-            "If you renamed the training file, update the import at the top of this page."
+            "If you renamed your script, update the import paths above."
         )
         st.markdown(
-            f"- **Sample window**: `{START}` → `{END}` (default placeholder)\n"
-            "- **Tickers**: unknown (set in your training scripts)\n"
+            f"- **Sample window**: `{START}` → `{END}` (default)\n"
+            "- **Tickers**: unknown\n"
         )
 
 with conf_right:
-    st.markdown("### What each `.pkl` contains")
+    st.markdown("### Contents of a results `.pkl` file")
 
     st.markdown(
         """
-        Each run of any model script (GBM / RF / PCA+LGBM) saves a results dictionary
-        with at least:
+        Each model (GBM / RF / PCA+LGBM / CatBoost) saves:
 
-        - **`monthly`**: monthly strategy & benchmark returns  
-        - **`weights`**: portfolio weights at each rebalance  
-        - **`monthly_train` / `monthly_test`**: 2010–2023 vs 2024–2025 split  
-        - **`weights_2025_bimonth`**: bi-monthly weights in 2025  
-        - **`equity_2025`**: $1000 ML portfolio vs $1000 SPY (2025)  
-        - **`metrics`**: train / test performance metrics (Sharpe, drawdown, etc.)  
+        - **`monthly`** — ML strategy & benchmark monthly returns  
+        - **`weights`** — portfolio weights at each monthly rebalance  
+        - **`monthly_train`** (2010–2023)  
+        - **`monthly_test`** (2024–2025)  
+        - **`weights_2025_bimonth`** — bi-monthly 2025 weights  
+        - **`equity_2025`** — $1000 ML portfolio vs SPY (2025)  
+        - **`metrics`** — Sharpe, vol, drawdown, etc.  
         """
     )
 
@@ -145,23 +157,19 @@ st.markdown("## 📝 Usage Notes")
 st.markdown(
     textwrap.dedent(
         """
-        - **Finance parameters live on the Run Models page**  
-          You control the **economic assumptions** there: risk aversion λ, transaction
-          costs in basis points, and the risk-free rate used for Sharpe. The ML model
-          hyperparameters stay fixed inside the scripts.
+        - **Finance settings** (λ, transaction costs, RF rate) live on the
+          **Run Model page**, not inside model scripts.
 
-        - **No accidental retraining**  
-          The results pages and comparison page only **load and visualize** saved
-          `.pkl` files. A new backtest only runs when you click **Run backtest** on
-          the dedicated page.
+        - Results pages only **load `.pkl` files** — no retraining happens.
 
-        - **Versioning by timestamp**  
-          Each run writes a new file like:
-          `gradientboost_results_YYYYMMDD_HHMMSS.pkl`,
-          `randomforest_results_YYYYMMDD_HHMMSS.pkl`,
-          or `pca_lightgbm_results_YYYYMMDD_HHMMSS.pkl`.  
-          Keep multiple runs side-by-side to compare different universes or
-          finance parameters.
+        - Every run creates a timestamped file:
+            ```
+            gradientboost_results_YYYYMMDD_HHMMSS.pkl  
+            randomforest_results_YYYYMMDD_HHMMSS.pkl  
+            pca_lightgbm_results_YYYYMMDD_HHMMSS.pkl  
+            catboost_results_YYYYMMDD_HHMMSS.pkl
+            ```
+        - Keep multiple runs to compare hyperparameters or finance assumptions.
         """
     )
 )
@@ -171,23 +179,24 @@ st.markdown(
 # ------------------------
 st.markdown("## 🧭 Where to go next")
 
-nav_col1, nav_col2 = st.columns(2)
+nav_left, nav_right = st.columns(2)
 
-with nav_col1:
-    st.markdown("### ➡️ Run and save new backtests")
+with nav_left:
+    st.markdown("### ➡️ Run new backtests")
     st.markdown(
         """
-        - Open the **“🧪 Run & Save ML Portfolio Backtests”** page  
-        - Pick a model and set finance parameters  
-        - Run a backtest and download the `.pkl` if you want  
+        - Go to **“🧪 Run & Save ML Portfolio Backtests”**  
+        - Choose GBM / RF / PCA+LGBM / CatBoost  
+        - Run + save  
         """
     )
 
-with nav_col2:
-    st.markdown("### 📊 Explore results & comparisons")
+with nav_right:
+    st.markdown("### 📊 Explore results")
     st.markdown(
         """
-        - Use the three model-specific pages (📈 / 🌲 / 🧬) to dive into a single model  
-        - Use **“⚖️ Model Comparison – GBM vs RF vs PCA+LGBM”** to see them together  
+        - Visit each model’s results page  
+        - Or compare all four in  
+          **“⚖️ Model Comparison – GBM vs RF vs PCA+LGBM vs CatBoost”**  
         """
     )

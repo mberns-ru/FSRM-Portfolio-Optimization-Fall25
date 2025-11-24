@@ -20,6 +20,10 @@ try:
 except Exception:
     pl = None
 
+try:
+    import _catboost as cb
+except Exception:
+    cb = None
 
 st.set_page_config(
     page_title="🧪 Run & Save ML Portfolio Backtests",
@@ -30,7 +34,12 @@ st.title("🧪 Run & Save ML Portfolio Backtests")
 
 st.markdown(
     """
-Use this page to **generate new results files** for your three models.
+Use this page to **generate new results files** for your four models:
+
+- 📈 Gradient Boost (XGBoost / GBM)  
+- 🌲 Random Forest  
+- 🧬 PCA + LightGBM  
+- 🐈 CatBoost  
 
 On this page you change only the **finance-related knobs**:
 
@@ -177,7 +186,7 @@ def finance_controls(defaults, prefix: str):
 
 
 # ==========================================================
-# Gradient Boost
+# Model choice
 # ==========================================================
 model_choice = st.selectbox(
     "Choose which model to run",
@@ -185,9 +194,13 @@ model_choice = st.selectbox(
         "Gradient Boost (XGBoost / GBM)",
         "Random Forest",
         "PCA + LightGBM",
+        "CatBoost",
     ],
 )
 
+# ==========================================================
+# Gradient Boost
+# ==========================================================
 if model_choice.startswith("Gradient"):
 
     if gb is None:
@@ -351,7 +364,7 @@ elif model_choice.startswith("Random"):
 # ==========================================================
 # PCA + LightGBM
 # ==========================================================
-else:
+elif model_choice.startswith("PCA"):
 
     if pl is None or gb is None:
         st.error("Could not import `_pca_lightgbm.py` / `_gradientboost.py`.")
@@ -424,6 +437,90 @@ else:
         with open(out_path, "rb") as f:
             st.download_button(
                 "⬇️ Download PCA+LGBM results",
+                data=f,
+                file_name=os.path.basename(out_path),
+                mime="application/octet-stream",
+            )
+
+# ==========================================================
+# CatBoost
+# ==========================================================
+else:
+
+    if cb is None or gb is None:
+        st.error("Could not import `_catboost.py` / `_gradientboost.py`.")
+        st.stop()
+
+    st.subheader("🐈 CatBoost Settings")
+
+    default_start = getattr(cb, "START", getattr(gb, "START", "2010-01-01"))
+    default_end = getattr(cb, "END", getattr(gb, "END", None))
+    default_train_start = getattr(gb, "TRAIN_START", "2010-01-01")
+    default_train_end = getattr(gb, "TRAIN_END", "2023-12-31")
+    default_test_start = getattr(gb, "TEST_START", "2024-01-01")
+    default_test_end = getattr(gb, "TEST_END", "2025-12-31")
+
+    start_default_date = date.fromisoformat(default_start)
+    end_default_date = date.today() if default_end in (None, "") else date.fromisoformat(default_end)
+
+    defaults = {
+        "start_date": start_default_date,
+        "end_date": end_default_date,
+        "rebal_freq": getattr(gb, "REBAL_FREQ", "M"),
+        "train_start_year": year_from_str(default_train_start, 2010),
+        "train_end_year": year_from_str(default_train_end, 2023),
+        "test_start_year": year_from_str(default_test_start, 2024),
+        "test_end_year": year_from_str(default_test_end, 2025),
+        "lambda_risk": getattr(gb, "LAMBDA_RISK", 5.0),
+        "tc_bps": getattr(gb, "TC_BPS", 5),
+        "rf_rate": getattr(gb, "RISK_FREE_ANNUAL", 0.015),
+        "initial_investment": getattr(gb, "INITIAL_INVESTMENT", 1000.0),
+    }
+
+    controls = finance_controls(defaults, prefix="CatBoost")
+
+    if controls["run"]:
+        # CatBoost module piggybacks on gb.run_backtest, so keep both in sync
+        gb.START = cb.START = date_to_str(controls["start_date"])
+        gb.END = cb.END = date_to_str(controls["end_date"])
+        gb.REBAL_FREQ = cb.REBAL_FREQ = controls["rebal_freq"]
+        gb.TRAIN_START = cb.TRAIN_START = controls["train_start"]
+        gb.TRAIN_END = cb.TRAIN_END = controls["train_end"]
+        gb.TEST_START = cb.TEST_START = controls["test_start"]
+        gb.TEST_END = cb.TEST_END = controls["test_end"]
+        gb.LAMBDA_RISK = cb.LAMBDA_RISK = controls["lambda_risk"]
+        gb.TC_BPS = cb.TC_BPS = controls["tc_bps"]
+        gb.RISK_FREE_ANNUAL = cb.RISK_FREE_ANNUAL = controls["rf_rate"]
+        gb.INITIAL_INVESTMENT = cb.INITIAL_INVESTMENT = controls["initial_investment"]
+
+        progress = st.progress(0, text="Downloading prices…")
+        prices = cb.download_prices(cb.TICKERS, cb.START, cb.END)
+        progress.progress(5, text="Running CatBoost backtest…")
+
+        def streamlit_tqdm(iterable, **kwargs):
+            seq = list(iterable)
+            total = len(seq)
+            if total == 0:
+                return seq
+            for i, x in enumerate(seq):
+                frac = (i + 1) / total
+                pct = 5 + int(90 * frac)
+                progress.progress(pct, text=f"Running CatBoost backtest… ({int(frac*100)}%)")
+                yield x
+
+        # CatBoost module monkey-patches gb.make_gbm inside cb.run_backtest,
+        # so wiring tqdm into gb is enough
+        gb.tqdm = streamlit_tqdm  # type: ignore[assignment]
+
+        results = cb.build_results(prices)
+        progress.progress(98, text="Saving results…")
+        out_path = cb.save_results(results, cb.RESULTS_DIR)
+        progress.progress(100, text="Done!")
+
+        st.success(f"Saved CatBoost results to: `{out_path}`")
+        with open(out_path, "rb") as f:
+            st.download_button(
+                "⬇️ Download CatBoost results",
                 data=f,
                 file_name=os.path.basename(out_path),
                 mime="application/octet-stream",

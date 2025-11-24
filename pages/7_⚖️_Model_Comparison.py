@@ -10,14 +10,13 @@ import altair as alt
 RESULTS_DIR = "results"
 
 st.set_page_config(
-    page_title="⚖️ Model Comparison – GBM vs RF vs PCA+LGBM",
+    page_title="⚖️ Model Comparison – GBM vs RF vs PCA+LGBM vs CatBoost",
     layout="wide",
 )
 
-st.title("⚖️ Model Comparison – GBM vs RF vs PCA+LGBM")
+st.title("⚖️ Model Comparison – GBM vs RF vs PCA+LGBM vs CatBoost")
 
 
-@st.cache_data(show_spinner=False)
 def load_latest(prefix: str):
     pattern = os.path.join(RESULTS_DIR, f"{prefix}_*.pkl")
     files = glob.glob(pattern)
@@ -37,8 +36,10 @@ def two_month_ret(df):
 gbm_loaded = load_latest("gradientboost_results")
 rf_loaded = load_latest("randomforest_results")
 pl_loaded = load_latest("pca_lightgbm_results")
+cb_loaded = load_latest("catboost_results")
 
-status_cols = st.columns(3)
+
+status_cols = st.columns(4)
 with status_cols[0]:
     if gbm_loaded is None:
         st.error("No GBM results found in `results/`.")
@@ -60,18 +61,28 @@ with status_cols[2]:
         path, _ = pl_loaded
         st.success(f"PCA+LGBM: `{os.path.basename(path)}`")
 
-if any(x is None for x in [gbm_loaded, rf_loaded, pl_loaded]):
-    st.info("Run all three models (or upload their results) before using this page.")
+with status_cols[3]:
+    if cb_loaded is None:
+        st.error("No CatBoost results found in `results/`.")
+    else:
+        path, _ = cb_loaded
+        st.success(f"CatBoost: `{os.path.basename(path)}`")
+
+
+# stop if any missing
+if any(x is None for x in [gbm_loaded, rf_loaded, pl_loaded, cb_loaded]):
+    st.info("Run all four models (or upload their results) before using this page.")
     st.stop()
 
+
+# unpack
 gbm_path, gbm_res = gbm_loaded
 rf_path, rf_res = rf_loaded
 pl_path, pl_res = pl_loaded
+cb_path, cb_res = cb_loaded
 
-# ----------------------------------------------------------
-# 1. Bi-monthly returns (2024–2025) – ML_Opt comparison
-# ----------------------------------------------------------
-st.markdown("## 1. Bi-monthly Returns (2024–2025) – ML_Opt Strategies")
+
+st.markdown("## Bi-monthly Returns (2024–2025)")
 
 returns_long_list = []
 
@@ -79,6 +90,7 @@ for label, res in [
     ("GBM", gbm_res),
     ("Random Forest", rf_res),
     ("PCA+LGBM", pl_res),
+    ("CatBoost", cb_res),
 ]:
     monthly_test = res["monthly_test"]
     test_2024 = monthly_test.loc["2024-01-01":"2025-12-31"]
@@ -86,52 +98,57 @@ for label, res in [
     if "ML_Opt" not in test_2024.columns:
         continue
 
+    # bi-monthly returns for this model
     r2m = (
         test_2024[["ML_Opt"]]
         .resample("2M")
         .apply(two_month_ret)
         .dropna(how="all")
     )
-    tmp = (
-        r2m.reset_index()
-        .rename(columns={"ML_Opt": "Return"})
-    )
+
+    tmp = r2m.reset_index().rename(columns={"ML_Opt": "Return"})
     tmp["Model"] = label
     returns_long_list.append(tmp)
 
 if returns_long_list:
     returns_2m_all = pd.concat(returns_long_list, ignore_index=True)
 
+    # make sure Date is datetime
+    returns_2m_all["Date"] = pd.to_datetime(returns_2m_all["Date"])
+
+    # base encoding
+    base = alt.Chart(returns_2m_all).encode(
+        x=alt.X("Date:T", title="Period start"),
+        y=alt.Y(
+            "Return:Q",
+            title="2-month return",
+            axis=alt.Axis(format="%"),
+        ),
+        color=alt.Color("Model:N", title="Model"),
+    )
+
+    # line + points, with hover tooltips
     chart_2m = (
-        alt.Chart(returns_2m_all)
-        .mark_bar()
+        base.mark_line(point=True)
         .encode(
-            x=alt.X("Date:T", title="Period Start"),
-            y=alt.Y("Return:Q", title="2-month return", axis=alt.Axis(format="%")),
-            color=alt.Color("Model:N", title="Model"),
             tooltip=[
-                "Date:T",
-                "Model:N",
-                alt.Tooltip("Return:Q", format=".2%"),
-            ],
+                alt.Tooltip("Date:T", title="Period start"),
+                alt.Tooltip("Model:N", title="Model"),
+                alt.Tooltip("Return:Q", title="2-month return", format=".2%"),
+            ]
         )
         .properties(height=350)
         .interactive()
     )
-    st.altair_chart(chart_2m, use_container_width=True)
 
-    # Table view
-    table_2m = returns_2m_all.copy()
-    table_2m["Return"] = table_2m["Return"].map(lambda x: f"{x:.2%}")
-    st.dataframe(table_2m, use_container_width=True)
+    st.altair_chart(chart_2m, use_container_width=True)
 else:
     st.info("No ML_Opt returns found for the models.")
-
 
 # ----------------------------------------------------------
 # 2. 2024–2025 Equity Curves – All Models vs SPY
 # ----------------------------------------------------------
-st.markdown("## 2. 2024–2025 Equity Curves – All Models vs SPY")
+st.markdown("## Equity Curves (2024–2025)")
 
 def get_equity_df(label, res):
     # Prefer new 'equity_test'
@@ -144,30 +161,31 @@ def get_equity_df(label, res):
     else:
         return None
 
-    # Try to rename the ML series to something standard
     ml_cols = [c for c in df.columns if "ML" in c or "Opt" in c]
     if ml_cols:
         ml_col = ml_cols[0]
     else:
-        # fall back to any non-SPY column
+        # fallback to any non-SPY column
         ml_col_candidates = [c for c in df.columns if "SPY" not in c]
         if not ml_col_candidates:
             return None
         ml_col = ml_col_candidates[0]
 
-    new_cols = {}
-    new_cols[ml_col] = f"{label}_ML"
+    new_cols = {ml_col: f"{label}_ML"}
     for c in df.columns:
         if "SPY" in c:
             new_cols[c] = "SPY"
     df = df.rename(columns=new_cols)
+
     return df[["SPY", f"{label}_ML"]] if "SPY" in df.columns else df[[f"{label}_ML"]]
+
 
 eq_pieces = []
 for label, res in [
     ("GBM", gbm_res),
     ("RF", rf_res),
     ("PCA+LGBM", pl_res),
+    ("CatBoost", cb_res),
 ]:
     df = get_equity_df(label, res)
     if df is not None:
@@ -191,12 +209,8 @@ else:
         .encode(
             x=alt.X("Date:T", title="Date"),
             y=alt.Y("Equity:Q", title="Equity ($)", scale=alt.Scale(zero=False)),
-            color=alt.Color("Series:N", title="Series"),
-            tooltip=[
-                "Date:T",
-                "Series:N",
-                alt.Tooltip("Equity:Q", format=",.0f"),
-            ],
+            color=alt.Color("Series:N", title="Model"),
+            tooltip=["Date:T", "Series:N", alt.Tooltip("Equity:Q", format=",.0f")],
         )
         .properties(height=350)
         .interactive()
@@ -204,16 +218,18 @@ else:
     st.altair_chart(chart_eq, use_container_width=True)
 
 
+
 # ----------------------------------------------------------
 # 3. Test-period metrics comparison (2024–2025)
 # ----------------------------------------------------------
-st.markdown("## 3. Test-period Metrics (2024–2025) – ML_Opt")
+st.markdown("## Model Testing Metrics")
 
 rows = []
 for label, res in [
     ("GBM", gbm_res),
     ("Random Forest", rf_res),
     ("PCA+LGBM", pl_res),
+    ("CatBoost", cb_res),
 ]:
     metrics = res.get("metrics", {})
     test_metrics = metrics.get("test", {})
@@ -235,13 +251,14 @@ if rows:
         mdf["sharpe"] = mdf["sharpe"].map(lambda x: f"{x:.2f}")
 
     st.dataframe(mdf, use_container_width=True)
+
     st.markdown(
         """
-- **total_return**: cumulative return over the test window (2024–2025).  
-- **ann_return**: annualized return over the test window.  
-- **ann_vol**: annualized volatility.  
-- **sharpe**: annualized Sharpe ratio (using the risk-free rate you set).  
-- **max_drawdown**: worst peak-to-trough loss in the test period.  
+- **total_return**: cumulative return  
+- **ann_return**: annualized return  
+- **ann_vol**: annualized volatility  
+- **sharpe**: annualized Sharpe ratio  
+- **max_drawdown**: worst peak-to-trough loss  
 """
     )
 else:

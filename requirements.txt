@@ -8,3 +8,4 @@ altair
 tqdm
 xgboost
 lightgbm
+catboost
